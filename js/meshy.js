@@ -197,7 +197,7 @@ Meshy.prototype.generateUI = function() {
     full: this.gui.addFolder("Auto Measure Full",
       "Automatic dressmaker's measurements of an upright torso scan, front facing -y."),
     basic: this.gui.addFolder("Auto Measure Basic",
-      "Automatic bust, under bust, waist, abdomen, and hip girths of an upright torso scan, front facing -y.")
+      "Automatic bust, under bust, waist, abdomen, and hip circumferences of an upright torso scan, front facing -y.")
   };
   // per-set Measure and Load buttons for dat.gui
   this.autoMeasureActions = {};
@@ -1484,7 +1484,7 @@ Meshy.prototype.buildAutoMeasureFolder = function() {
 
     folder.add(this.autoMeasureActions[modeKey], "run").name("Measure")
       .title(basic ?
-        "Find the girth levels and measure the bust, under bust, waist, abdomen, and hip." :
+        "Find the levels and measure the bust, under bust, waist, abdomen, and hip circumferences." :
         "Find the landmarks and measure the torso.");
     folder.add(this.autoMeasureActions[modeKey], "load").name("Load measurements")
       .title("Load " + mode.name.toLowerCase() + " measurements saved from this scan with Save measurements.");
@@ -1695,7 +1695,7 @@ Meshy.prototype.autoMeasureDraw = function() {
     am.results.forEach(function(result) {
       if (result.segments.length === 0) return;
 
-      var color = result.group === "Girths" ? 0x2a7fff : 0xff6a00;
+      var color = result.group === "Circumferences" ? 0x2a7fff : 0xff6a00;
       var marker = Markers.create(Markers.Types.contour, { name: name, color: color });
 
       marker.setFromSegments(result.segments);

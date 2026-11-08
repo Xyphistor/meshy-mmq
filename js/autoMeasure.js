@@ -864,7 +864,7 @@ var AutoMeasure = (function() {
     // side neck points: the sides of the neck girth
     var neckLoop = neckGirthLoop(sliceMesh, cfNeck, nape);
 
-    if (!neckLoop) throw new Error("Couldn't find the neck girth.");
+    if (!neckLoop) throw new Error("Couldn't find the neck circumference.");
 
     var neckSideL = null, neckSideR = null;
 
@@ -1113,13 +1113,13 @@ var AutoMeasure = (function() {
 
   // definitions of the measurements, in report order
   var Definitions = [
-    { key: "neck", name: "Neck", group: "Girths" },
-    { key: "highBust", name: "High bust", group: "Girths" },
-    { key: "bust", name: "Bust", group: "Girths" },
-    { key: "underBust", name: "Under bust", group: "Girths" },
-    { key: "waist", name: "Waist", group: "Girths" },
-    { key: "abdomen", name: "Abdomen", group: "Girths" },
-    { key: "hip", name: "Hip", group: "Girths" },
+    { key: "neck", name: "Neck", group: "Circumferences" },
+    { key: "highBust", name: "High bust", group: "Circumferences" },
+    { key: "bust", name: "Bust", group: "Circumferences" },
+    { key: "underBust", name: "Under bust", group: "Circumferences" },
+    { key: "waist", name: "Waist", group: "Circumferences" },
+    { key: "abdomen", name: "Abdomen", group: "Circumferences" },
+    { key: "hip", name: "Hip", group: "Circumferences" },
 
     { key: "frontLength", name: "Centre front (neck to waist)", group: "Front" },
     { key: "bustHeightL", name: "Neck to bust point (L)", group: "Front" },
@@ -1399,8 +1399,8 @@ var AutoMeasure = (function() {
   //  filename: scan filename
   //  results: from the mode's measure()
   //  images: array of { name, url } views of the model
-  //  mode: "full" (default) or "basic"; the basic report has one row of
-  //   girths across the top
+  //  mode: "full" (default) or "basic"; the basic report has a single table
+  //   of circumferences
   function reportHTML(params) {
     var date = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
     var basic = params.mode === "basic";
@@ -1432,11 +1432,11 @@ var AutoMeasure = (function() {
     }).join("");
 
     if (basic) {
-      tables = "<table class=\"row\"><thead><tr><th>Girths</th>" +
-        params.results.map(function(result) { return "<th>" + escapeHTML(result.name) + "</th>"; }).join("") +
-        "</tr></thead><tbody><tr><td class=\"unit\">cm</td>" +
-        params.results.map(function(result) { return "<td>" + cm(result) + "</td>"; }).join("") +
-        "</tr></tbody></table>";
+      tables = "<table class=\"circumferences\"><thead><tr><th>Circumference</th><th class=\"value\">cm</th></tr></thead><tbody>" +
+        params.results.map(function(result) {
+          return "<tr><td>" + escapeHTML(result.name) + "</td><td class=\"value\">" + cm(result) + "</td></tr>";
+        }).join("") +
+        "</tbody></table>";
     }
 
     var images = params.images.map(function(image) {
@@ -1446,9 +1446,9 @@ var AutoMeasure = (function() {
 
     var title = params.name ? escapeHTML(params.name) : "Measurements";
     var note = basic ?
-      "Girths are measured level, bridging hollows as a tape measure would. Blue: girths." :
-      "Girths are measured level, and lengths along the surface; both bridge hollows as a tape measure would. " +
-      "Blue: girths. Orange: lengths. L and R are the body's left and right.";
+      "Circumferences are measured level, bridging hollows as a tape measure would." :
+      "Circumferences are measured level, and lengths along the surface; both bridge hollows as a tape measure would. " +
+      "Blue: circumferences. Orange: lengths. L and R are the body's left and right.";
 
     return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
       "<title>" + title + " - " + (basic ? "basic " : "") + "measurements</title>" +
@@ -1464,11 +1464,8 @@ var AutoMeasure = (function() {
       "td { border-bottom: 1px solid #ddd; padding: 3px 4px; }" +
       ".value { text-align: right; font-variant-numeric: tabular-nums; width: 18mm; }" +
       ".tables.basic { columns: 1; }" +
-      "table.row { font-size: 15px; }" +
-      "table.row th, table.row td { text-align: center; }" +
-      "table.row th:first-child { text-align: left; }" +
-      "table.row td { font-size: 18px; font-weight: bold; font-variant-numeric: tabular-nums; }" +
-      "table.row td.unit { text-align: left; font-size: 13px; font-weight: normal; color: #444; }" +
+      "table.circumferences { width: 90mm; font-size: 15px; }" +
+      "table.circumferences td.value { font-weight: bold; }" +
       ".views { display: flex; justify-content: space-between; gap: 4mm; margin-top: 2mm; break-inside: avoid; }" +
       "figure { margin: 0; flex: 1; text-align: center; }" +
       "figure img { width: 100%; border: 1px solid #ddd; }" +
