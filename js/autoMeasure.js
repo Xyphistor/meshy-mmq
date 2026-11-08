@@ -1397,17 +1397,30 @@ var AutoMeasure = (function() {
   // params:
   //  name: report name (e.g. customer or job)
   //  filename: scan filename
-  //  results: from the mode's measure()
+  //  mode: "full" or "basic" for the automatic measurements, or null if
+  //   there are none; the basic report has a single table of circumferences
+  //  results: from the mode's measure(), or an empty array
+  //  measurements: other measurements, as an array of { name, value, unit }
+  //   where unit is "cm" or "°"
   //  images: array of { name, url } views of the model
-  //  mode: "full" (default) or "basic"; the basic report has a single table
-  //   of circumferences
   function reportHTML(params) {
     var date = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
+    var full = params.mode === "full";
     var basic = params.mode === "basic";
+    var measurements = params.measurements || [];
     var groups = [];
 
     function cm(result) {
       return result.value === null ? "&ndash;" : (result.value / 10).toFixed(1);
+    }
+
+    function table(heading, rows, className) {
+      return "<table" + (className ? " class=\"" + className + "\"" : "") + ">" +
+        "<thead><tr><th>" + escapeHTML(heading) + "</th><th class=\"value\">cm</th></tr></thead><tbody>" +
+        rows.map(function(row) {
+          return "<tr><td>" + escapeHTML(row.name) + "</td><td class=\"value\">" + row.value + "</td></tr>";
+        }).join("") +
+        "</tbody></table>";
     }
 
     params.results.forEach(function(result) {
@@ -1419,24 +1432,23 @@ var AutoMeasure = (function() {
         groups.push(group);
       }
 
-      group.rows.push(result);
+      group.rows.push({ name: result.name, value: cm(result) });
     });
 
+    // the full set is in columns; the basic set and the other measurements
+    // are side by side lists
+    var listClass = full ? "" : "list";
     var tables = groups.map(function(group) {
-      var rows = group.rows.map(function(result) {
-        return "<tr><td>" + escapeHTML(result.name) + "</td><td class=\"value\">" + cm(result) + "</td></tr>";
-      }).join("");
-
-      return "<table><thead><tr><th>" + escapeHTML(group.name) + "</th><th class=\"value\">cm</th></tr></thead>" +
-        "<tbody>" + rows + "</tbody></table>";
+      return table(basic ? "Circumference" : group.name, group.rows, listClass);
     }).join("");
 
-    if (basic) {
-      tables = "<table class=\"circumferences\"><thead><tr><th>Circumference</th><th class=\"value\">cm</th></tr></thead><tbody>" +
-        params.results.map(function(result) {
-          return "<tr><td>" + escapeHTML(result.name) + "</td><td class=\"value\">" + cm(result) + "</td></tr>";
-        }).join("") +
-        "</tbody></table>";
+    if (measurements.length > 0) {
+      tables += table("Measurements", measurements.map(function(m) {
+        var value = m.value === null || m.value === undefined ? "&ndash;" :
+          m.value.toFixed(1) + (m.unit === "cm" ? "" : escapeHTML(m.unit));
+
+        return { name: m.name, value: value };
+      }), listClass);
     }
 
     var images = params.images.map(function(image) {
@@ -1445,13 +1457,13 @@ var AutoMeasure = (function() {
     }).join("");
 
     var title = params.name ? escapeHTML(params.name) : "Measurements";
-    var note = basic ?
-      "Circumferences are measured level, bridging hollows as a tape measure would." :
+    var note = full ?
       "Circumferences are measured level, and lengths along the surface; both bridge hollows as a tape measure would. " +
-      "Blue: circumferences. Orange: lengths. L and R are the body's left and right.";
+      "Blue: circumferences. Orange: lengths. L and R are the body's left and right." :
+      basic ? "Circumferences are measured level, bridging hollows as a tape measure would." : "";
 
     return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
-      "<title>" + title + " - " + (basic ? "basic " : "") + "measurements</title>" +
+      "<title>" + title + " - measurements</title>" +
       "<style>" +
       "@page { size: A4 portrait; margin: 12mm; }" +
       "body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 0 auto; max-width: 190mm; padding: 8mm 0; }" +
@@ -1463,9 +1475,9 @@ var AutoMeasure = (function() {
       "th { text-align: left; border-bottom: 1px solid #111; padding: 3px 4px; }" +
       "td { border-bottom: 1px solid #ddd; padding: 3px 4px; }" +
       ".value { text-align: right; font-variant-numeric: tabular-nums; width: 18mm; }" +
-      ".tables.basic { columns: 1; }" +
-      "table.circumferences { width: 90mm; font-size: 15px; }" +
-      "table.circumferences td.value { font-weight: bold; }" +
+      ".tables.lists { columns: auto; display: flex; flex-wrap: wrap; align-items: flex-start; gap: 0 10mm; }" +
+      "table.list { width: 90mm; font-size: 15px; }" +
+      "table.list td.value { font-weight: bold; }" +
       ".views { display: flex; justify-content: space-between; gap: 4mm; margin-top: 2mm; break-inside: avoid; }" +
       "figure { margin: 0; flex: 1; text-align: center; }" +
       "figure img { width: 100%; border: 1px solid #ddd; }" +
@@ -1475,130 +1487,10 @@ var AutoMeasure = (function() {
       "</style></head><body>" +
       "<header><h1>" + title + "</h1><div class=\"meta\">" + date +
       (params.filename ? "<br>Scan: " + escapeHTML(params.filename) : "") + "</div></header>" +
-      "<div class=\"tables" + (basic ? " basic" : "") + "\">" + tables + "</div>" +
+      "<div class=\"tables" + (full ? "" : " lists") + "\">" + tables + "</div>" +
       "<div class=\"views\">" + images + "</div>" +
-      "<p class=\"note\">" + note + "</p>" +
+      (note ? "<p class=\"note\">" + note + "</p>" : "") +
       "</body></html>";
-  }
-
-
-
-  // saving and loading
-
-  var FILE_FORMAT = "meshy-auto-measure";
-  var FILE_VERSION = 1;
-
-  function round(v, places) {
-    var f = Math.pow(10, places);
-
-    return Math.round(v * f) / f;
-  }
-
-  // data to save to a file: landmarks are in mm relative to the minimum
-  // corner of the scan's bounding box, so they still line up if the scan is
-  // imported in a different place; the measurements are for reference only
-  // params:
-  //  mode: "full" or "basic"
-  //  name: report name
-  //  filename: scan filename
-  //  sliceMesh, landmarks, results
-  function saveData(params) {
-    var mode = Modes[params.mode];
-    var min = params.sliceMesh.min;
-    var size = params.sliceMesh.max.clone().sub(min);
-    var landmarks = {};
-
-    for (var key in mode.landmarkNames) {
-      var p = params.landmarks[key];
-      if (!p) continue;
-
-      landmarks[key] = [round(p.x - min.x, 2), round(p.y - min.y, 2), round(p.z - min.z, 2)];
-    }
-
-    return {
-      format: FILE_FORMAT,
-      version: FILE_VERSION,
-      mode: mode.key,
-      saved: new Date().toISOString(),
-      name: params.name || "",
-      scan: params.filename || "",
-      units: "mm",
-      scanSize: [round(size.x, 2), round(size.y, 2), round(size.z, 2)],
-      midX: round(params.landmarks.midX - min.x, 2),
-      landmarks: landmarks,
-      measurementsCm: params.results.map(function(result) {
-        return {
-          key: result.key,
-          name: result.name,
-          value: result.value === null ? null : round(result.value / 10, 1)
-        };
-      })
-    };
-  }
-
-  // landmarks for the given mode ("full" or "basic") from saved data, placed
-  // on the given scan; any missing from the file are found automatically
-  // returns { landmarks, name, scan, sizeDifference } where sizeDifference is
-  // the largest difference in mm between the saved and current scan sizes
-  function loadData(sliceMesh, data, modeKey) {
-    if (!data || data.format !== FILE_FORMAT || !data.landmarks) {
-      throw new Error("This isn't an Auto Measure file.");
-    }
-
-    if (data.version > FILE_VERSION) {
-      throw new Error("This file was saved by a newer version of Auto Measure.");
-    }
-
-    var mode = Modes[modeKey];
-    // files saved before there was a basic mode are full
-    var fileMode = Modes[data.mode || "full"];
-
-    if (fileMode !== mode) {
-      throw new Error("This file has " + (fileMode ? fileMode.name.toLowerCase() : "unknown") +
-        " measurements" + (fileMode ? "; load it under Auto Measure " + fileMode.name : "") + ".");
-    }
-
-    var min = sliceMesh.min;
-    var size = sliceMesh.max.clone().sub(min);
-    var landmarks = {};
-    var missing = false;
-
-    for (var key in mode.landmarkNames) {
-      var p = data.landmarks[key];
-
-      if (p && p.length === 3) {
-        landmarks[key] = new Vector3(p[0] + min.x, p[1] + min.y, p[2] + min.z);
-      }
-      else missing = true;
-    }
-
-    if (typeof data.midX === "number") landmarks.midX = data.midX + min.x;
-    else missing = true;
-
-    if (missing) {
-      var found = mode.findLandmarks(sliceMesh);
-
-      for (var k in found) {
-        if (landmarks[k] === undefined) landmarks[k] = found[k];
-      }
-    }
-
-    var sizeDifference = 0;
-
-    if (data.scanSize && data.scanSize.length === 3) {
-      sizeDifference = Math.max(
-        Math.abs(data.scanSize[0] - size.x),
-        Math.abs(data.scanSize[1] - size.y),
-        Math.abs(data.scanSize[2] - size.z)
-      );
-    }
-
-    return {
-      landmarks: landmarks,
-      name: data.name || "",
-      scan: data.scan || "",
-      sizeDifference: sizeDifference
-    };
   }
 
 
@@ -1608,8 +1500,6 @@ var AutoMeasure = (function() {
     findLandmarks: findLandmarks,
     measure: measure,
     reportHTML: reportHTML,
-    saveData: saveData,
-    loadData: loadData,
     tape: tape,
     Modes: Modes,
     Definitions: Definitions,

@@ -136,6 +136,11 @@ var InfoBox = (function() {
       });
     },
 
+    // Change the list's title, if it has one.
+    setTitle: function(title) {
+      if (this.title) this.title.textContent = title;
+    },
+
     // Creates a line in the InfoList, returns HTML element that contains the value.
     createLine: function(title) {
       var li = document.createElement("li");
