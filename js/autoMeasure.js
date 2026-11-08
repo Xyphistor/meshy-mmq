@@ -1439,11 +1439,14 @@ var AutoMeasure = (function() {
     // are side by side lists
     var listClass = full ? "" : "list";
     var tables = groups.map(function(group) {
-      return table(basic ? "Circumference" : group.name, group.rows, listClass);
+      // the circumferences are the basic dimensions in both sets
+      var heading = basic || group.name === "Circumferences" ? "Basic Dimensions" : group.name;
+
+      return table(heading, group.rows, listClass);
     }).join("");
 
     if (measurements.length > 0) {
-      tables += table("Measurements", measurements.map(function(m) {
+      tables += table("Additional Measurements", measurements.map(function(m) {
         var value = m.value === null || m.value === undefined ? "&ndash;" :
           m.value.toFixed(1) + (m.unit === "cm" ? "" : escapeHTML(m.unit));
 
