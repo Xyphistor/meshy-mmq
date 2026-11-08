@@ -11,6 +11,8 @@
 // Constructor.
 Meshy = function() {
   this.units = Units.mm;
+  // measurements are shown in these units; the mesh itself stays in mm
+  this.displayUnits = Units.cm;
 
   // params
   this.buildVolumeSize = new THREE.Vector3(145, 145, 175);
@@ -294,17 +296,20 @@ Meshy.prototype.generateUI = function() {
     .title("Delete the mesh.");
 
   this.infoBox = new InfoBox(this.displayPrecision);
-  this.infoBox.add("Units", this, "units");
+  var d = this.displayFactor();
+  this.infoBox.add("Units", this, "displayUnits");
   this.infoBox.add("Polycount", this, ["model","getPolyCount"]);
   this.infoBox.add("Vertex count", this, ["model","getVertexCount"]);
-  this.infoBox.add("x range", this, ["model","getXRange"]);
-  this.infoBox.add("y range", this, ["model","getYRange"]);
-  this.infoBox.add("z range", this, ["model","getZRange"]);
-  this.infoBox.add("Center", this, ["model","getCenter"]);
-  this.infoBox.add("Size", this, ["model","getSize"]);
-  this.infoBox.add("Surface area", this, ["model","surfaceArea"]);
-  this.infoBox.add("Volume", this, ["model","volume"]);
-  this.infoBox.add("Center of mass", this, ["model","centerOfMass"]);
+  this.infoBox.add("x range", this, ["model","getXRange"], undefined, d);
+  this.infoBox.add("y range", this, ["model","getYRange"], undefined, d);
+  this.infoBox.add("z range", this, ["model","getZRange"], undefined, d);
+  this.infoBox.add("Center", this, ["model","getCenter"], undefined, d);
+  this.infoBox.add("Size", this, ["model","getSize"], undefined, d);
+  this.infoBox.add("Surface area (" + this.displayUnits + "²)", this, ["model","surfaceArea"],
+    undefined, this.displayFactor(2));
+  this.infoBox.add("Volume (" + this.displayUnits + "³)", this, ["model","volume"],
+    undefined, this.displayFactor(3));
+  this.infoBox.add("Center of mass", this, ["model","centerOfMass"], undefined, d);
   this.infoBox.update();
 
   this.initViewport();
@@ -655,7 +660,9 @@ Meshy.prototype.onScaleToMeasurement = function() {
   if (!result || !result.ready) return;
 
   var key = this.measurementToScale;
-  var currentValue = result[key];
+  // in the display units, like the value entered
+  var currentValue = result[key] !== undefined ?
+    result[key] * this.measurementDisplayFactor(key) : undefined;
 
   if (currentValue !== undefined) {
     var factor = this.measurementToScaleValue / currentValue;
@@ -1078,8 +1085,9 @@ Meshy.prototype.scaleToRingSize = function() {
   var tmpVal = this.measurementToScaleValue;
   var tmpType = this.measurementToScale;
 
+  // ring sizes are diameters in mm
   this.measurementToScale = "diameter";
-  this.measurementToScaleValue = this.ringSize;
+  this.measurementToScaleValue = this.ringSize * this.displayFactor();
 
   this.onScaleToMeasurement();
   this.onFinishScale();
@@ -1128,9 +1136,11 @@ Meshy.prototype.buildMeasurementFolder = function() {
   this.crossSectionArrayFolder = this.measurementFolder.addFolder("Cross-section array", "Make multiple cross-section measurements.");
   this.crossSectionArrayFolder.add(this, "crossSectionArrayAxis", ["x", "y", "z"]).name("Axis")
     .title("Axis normal to the cross-section planes.");
-  this.crossSectionArrayFolder.add(this, "crossSectionArrayOffset", 0).precision(4).name("Min offset")
+  this.crossSectionArrayFolder.add(this, "crossSectionArrayOffset", 0).precision(4)
+    .name("Min offset (" + this.displayUnits + ")")
     .title("Offset from the mesh's minimum bound on the measurement axis.");
-  this.crossSectionArrayFolder.add(this, "crossSectionArrayIncrement", 0.0001).precision(4).name("Increment")
+  this.crossSectionArrayFolder.add(this, "crossSectionArrayIncrement", 0.0001).precision(4)
+    .name("Increment (" + this.displayUnits + ")")
     .title("Distance between adjacent cross-section planes.");
   this.crossSectionArrayFolder.add(this, "crossSectionArrayFilename").name("Filename")
     .title("Filename for the measurement result.")
@@ -1299,8 +1309,10 @@ Meshy.prototype.measureCrossSectionArray = function() {
   if (!this.model) return;
 
   var axis = this.crossSectionArrayAxis;
-  var increment = this.crossSectionArrayIncrement;
-  var offset = this.crossSectionArrayOffset;
+  // offset and increment are entered in the display units
+  var d = this.displayFactor();
+  var increment = this.crossSectionArrayIncrement / d;
+  var offset = this.crossSectionArrayOffset / d;
   var size = this.model.getSize()[axis];
   var min = this.model.getMin()[axis];
 
@@ -1325,10 +1337,11 @@ Meshy.prototype.measureCrossSectionArray = function() {
       axis: this.crossSectionArrayAxis,
       p: [point]
     });
+    // results in the display units
     results.push({
-      position: point[axis],
-      area: result.area,
-      length: result.length
+      position: point[axis] * d,
+      area: result.area * d * d,
+      length: result.length * d
     });
   }
 
@@ -1339,6 +1352,7 @@ Meshy.prototype.measureCrossSectionArray = function() {
     // https://stackoverflow.com/a/30800715
     dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify({
       axis: axis,
+      units: this.displayUnits,
       results: results
     }));
   }
@@ -1402,44 +1416,50 @@ Meshy.prototype.addMeasurement = function(params) {
   this.measurementData.push(item);
 
   var type = params.type;
+  var uuid = item.measurement.uuid;
+  // lengths and areas in the display units
+  var units = " (" + this.displayUnits + ")";
+  var areaTitle = "Area (" + this.displayUnits + "²)";
+  var d = this.displayFactor();
+  var d2 = this.displayFactor(2);
 
   if (type === Measurement.Types.length) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Length", params.color);
-    item.list.add("Length", item, ["result", "length"]);
-    item.list.add("X", item, ["result", "vector", "x"]);
-    item.list.add("Y", item, ["result", "vector", "y"]);
-    item.list.add("Z", item, ["result", "vector", "z"]);
+    item.list = this.infoBox.addList(uuid, "Length" + units, params.color);
+    item.list.add("Length", item, ["result", "length"], undefined, d);
+    item.list.add("X", item, ["result", "vector", "x"], undefined, d);
+    item.list.add("Y", item, ["result", "vector", "y"], undefined, d);
+    item.list.add("Z", item, ["result", "vector", "z"], undefined, d);
   }
   else if (type === Measurement.Types.contour) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Contour", params.color);
-    item.list.add("Contour length", item, ["result", "length"]);
-    item.list.add("Straight length", item, ["result", "straightLength"]);
+    item.list = this.infoBox.addList(uuid, "Contour" + units, params.color);
+    item.list.add("Contour length", item, ["result", "length"], undefined, d);
+    item.list.add("Straight length", item, ["result", "straightLength"], undefined, d);
   }
   else if (type === Measurement.Types.angle) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Angle", params.color);
+    item.list = this.infoBox.addList(uuid, "Angle", params.color);
     item.list.add("Angle", item, ["result", "angleDegrees"]);
   }
   else if (type === Measurement.Types.circle) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Circle", params.color);
-    item.list.add("Radius", item, ["result", "radius"]);
-    item.list.add("Diameter", item, ["result", "diameter"]);
-    item.list.add("Circumference", item, ["result", "circumference"]);
-    item.list.add("Area", item, ["result", "area"]);
+    item.list = this.infoBox.addList(uuid, "Circle" + units, params.color);
+    item.list.add("Radius", item, ["result", "radius"], undefined, d);
+    item.list.add("Diameter", item, ["result", "diameter"], undefined, d);
+    item.list.add("Circumference", item, ["result", "circumference"], undefined, d);
+    item.list.add(areaTitle, item, ["result", "area"], undefined, d2);
     item.list.add("Normal", item, ["result", "normal"]);
   }
   else if (type === Measurement.Types.crossSection) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Cross-section " + params.axis, params.color);
-    item.list.add("Area", item, ["result", "area"]);
-    item.list.add("Min", item, ["result", "boundingBox", "min"]);
-    item.list.add("Max", item, ["result", "boundingBox", "max"]);
-    item.list.add("Contour length", item, ["result", "length"]);
+    item.list = this.infoBox.addList(uuid, "Cross-section " + params.axis + units, params.color);
+    item.list.add(areaTitle, item, ["result", "area"], undefined, d2);
+    item.list.add("Min", item, ["result", "boundingBox", "min"], undefined, d);
+    item.list.add("Max", item, ["result", "boundingBox", "max"], undefined, d);
+    item.list.add("Contour length", item, ["result", "length"], undefined, d);
   }
   else if (type === Measurement.Types.orientedCrossSection) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Local cross-section", params.color);
-    item.list.add("Area", item, ["result", "area"]);
-    item.list.add("Min", item, ["result", "boundingBox", "min"]);
-    item.list.add("Max", item, ["result", "boundingBox", "max"]);
-    item.list.add("Contour length", item, ["result", "length"]);
+    item.list = this.infoBox.addList(uuid, "Local cross-section" + units, params.color);
+    item.list.add(areaTitle, item, ["result", "area"], undefined, d2);
+    item.list.add("Min", item, ["result", "boundingBox", "min"], undefined, d);
+    item.list.add("Max", item, ["result", "boundingBox", "max"], undefined, d);
+    item.list.add("Contour length", item, ["result", "length"], undefined, d);
   }
   else return;
 
@@ -1950,12 +1970,26 @@ Meshy.prototype.onChangeMeasurementToScale = function() {
   if (!result || !result.ready) return;
 
   // the new value defaults to the current value
-  this.measurementToScaleValue = result[this.measurementToScale];
+  var key = this.measurementToScale;
+  this.measurementToScaleValue = result[key] !== undefined ?
+    result[key] * this.measurementDisplayFactor(key) : undefined;
 
   // update controller
   var controller = this.measurementToScaleValueController;
 
-  if (controller) controller.updateDisplay();
+  if (controller) {
+    controller.name("Value (" + this.displayUnits + (key === "area" ? "²" : "") + ")");
+    controller.updateDisplay();
+  }
+}
+// factor to convert a length from the model's units to the display units;
+// power is 2 for areas, 3 for volumes
+Meshy.prototype.displayFactor = function(power) {
+  return Math.pow(Units.getFactor(this.units, this.displayUnits), power || 1);
+}
+// display factor for the given measurement result key
+Meshy.prototype.measurementDisplayFactor = function(key) {
+  return this.displayFactor(key === "area" ? 2 : 1);
 }
 Meshy.prototype.onRemoveLastMeasurement = function() {
   if (this.measurementsExist()) return;

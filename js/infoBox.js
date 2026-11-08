@@ -16,6 +16,7 @@
 //   -props: a single property name, or an array of property names, that
 //     lead to the data source
 //   -def: default value if the line needs to be calculated
+//   -scale: optional factor for numbers and vectors, e.g. to show mm in cm
 //
 //  Prop names that are functions are called instead of dereferenced,
 //   but this can be expensive.
@@ -86,8 +87,8 @@ var InfoBox = (function() {
     },
 
     // adding a line to the InfoBox adds it to the default list
-    add: function(title, source, props, def) {
-      this.lists.default.add(title, source, props, def);
+    add: function(title, source, props, def, scale) {
+      this.lists.default.add(title, source, props, def, scale);
     }
 
   });
@@ -119,7 +120,7 @@ var InfoBox = (function() {
 
   Object.assign(InfoList.prototype, {
     // Add a line.
-    add: function(title, source, props, def) {
+    add: function(title, source, props, def, scale) {
       var liValueElement = this.createLine(title);
 
       if (!isArray(props)){
@@ -130,7 +131,8 @@ var InfoBox = (function() {
         value: liValueElement,
         source: source,
         props: props,
-        def: def
+        def: def,
+        scale: scale !== undefined ? scale : 1
       });
     },
 
@@ -166,7 +168,7 @@ var InfoBox = (function() {
           continue;
         }
 
-        var value = this.getPropValue(item.source, item.props);
+        var value = this.getPropValue(item.source, item.props, item.scale);
 
         if (value==="" && item.def) value = item.def;
 
@@ -180,8 +182,11 @@ var InfoBox = (function() {
       else return +num.toFixed(this.parent.decimals);
     },
 
-    // Get the value of a prop as mapped through .add or .addMultiple.
-    getPropValue: function(source, propPath) {
+    // Get the value of a prop as mapped through .add or .addMultiple; numbers
+    // and vectors are multiplied by scale if given.
+    getPropValue: function(source, propPath, scale) {
+      if (scale === undefined) scale = 1;
+
       for (var i=0; i<propPath.length; i++) {
         if (isFunction(source[propPath[i]])) source = source[propPath[i]]();
         else source = source[propPath[i]];
@@ -189,21 +194,21 @@ var InfoBox = (function() {
       }
       var value;
 
-      if (isNumber(source)) value = this.formatNumber(source);
+      if (isNumber(source)) value = this.formatNumber(source * scale);
       else if (source.isVector2) {
         value = "[";
-        value += this.formatNumber(source.x);
+        value += this.formatNumber(source.x * scale);
         value += ", ";
-        value += this.formatNumber(source.y);
+        value += this.formatNumber(source.y * scale);
         value += "]";
       }
       else if (source.isVector3) {
         value = "[";
-        value += this.formatNumber(source.x);
+        value += this.formatNumber(source.x * scale);
         value += ", ";
-        value += this.formatNumber(source.y);
+        value += this.formatNumber(source.y * scale);
         value += ", ";
-        value += this.formatNumber(source.z);
+        value += this.formatNumber(source.z * scale);
         value += "]";
       }
       else value = source;
