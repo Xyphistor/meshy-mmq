@@ -29,6 +29,10 @@
 //   { key, name, group, value, segments }
 //  where value is in mm (null if the measurement failed) and segments is an
 //  array of THREE.Line3 showing the tape
+//
+//  AutoMeasure.Modes.basic has its own findLandmarks and measure for just the
+//  bust, under bust, waist, abdomen, and hip girths; Modes.full uses the
+//  functions above
 
 
 
@@ -926,14 +930,6 @@ var AutoMeasure = (function() {
 
     var zWaist = waistLevel.z;
 
-    // level landmarks are shown at the front of the body on the midline
-    function levelPoint(z) {
-      var loop = torsoLoop(sliceMesh, z);
-      var p = loop ? firstCrossing(loop, new Vector3(midX, 0, z), back) : null;
-
-      return p || new Vector3(midX, sliceMesh.min.y, z);
-    }
-
     // waist points below the busts: nearest points on the waist line
     var waistLoop = torsoLoop(sliceMesh, zWaist);
 
@@ -949,12 +945,35 @@ var AutoMeasure = (function() {
       underarmR: underarm.right,
       bustL: bustL,
       bustR: bustR,
-      underBust: levelPoint(zUnderBust),
-      waist: levelPoint(zWaist),
+      underBust: levelPoint(sliceMesh, midX, zUnderBust),
+      waist: levelPoint(sliceMesh, midX, zWaist),
       waistBustL: nearestOnLoop(waistLoop, bustL),
       waistBustR: nearestOnLoop(waistLoop, bustR),
-      abdomen: levelPoint((zWaist + zHip) / 2),
-      hip: levelPoint(zHip)
+      abdomen: levelPoint(sliceMesh, midX, (zWaist + zHip) / 2),
+      hip: levelPoint(sliceMesh, midX, zHip)
+    };
+  }
+
+  // level landmarks are shown at the front of the body on the midline
+  function levelPoint(sliceMesh, midX, z) {
+    var loop = torsoLoop(sliceMesh, z);
+    var p = loop ? firstCrossing(loop, new Vector3(midX, 0, z), Y) : null;
+
+    return p || new Vector3(midX, sliceMesh.min.y, z);
+  }
+
+  // landmarks for the basic measurements: just the girth levels
+  function findBasicLandmarks(sliceMesh) {
+    var lm = findLandmarks(sliceMesh);
+    var zBust = (lm.bustL.z + lm.bustR.z) / 2;
+
+    return {
+      midX: lm.midX,
+      bust: levelPoint(sliceMesh, lm.midX, zBust),
+      underBust: lm.underBust,
+      waist: lm.waist,
+      abdomen: lm.abdomen,
+      hip: lm.hip
     };
   }
 
@@ -1159,14 +1178,8 @@ var AutoMeasure = (function() {
       return { length: a.length + b.length, segments: a.segments.concat(b.segments) };
     }
 
-    // horizontal girth at height z
     function girth(z) {
-      var loop = torsoLoop(sliceMesh, z);
-      if (!loop) return null;
-
-      var hull = loopHull(loop);
-
-      return { length: closedLength(hull), segments: closedSegments(hull) };
+      return girthAt(sliceMesh, z);
     }
 
     // front or back midline point at height z
@@ -1290,7 +1303,23 @@ var AutoMeasure = (function() {
       }));
     });
 
-    return Definitions.map(function(def) {
+    return resultList(Definitions, results);
+  }
+
+  // horizontal girth at height z, bridging hollows
+  function girthAt(sliceMesh, z) {
+    var loop = torsoLoop(sliceMesh, z);
+    if (!loop) return null;
+
+    var hull = loopHull(loop);
+
+    return { length: closedLength(hull), segments: closedSegments(hull) };
+  }
+
+  // results in the order of the definitions, from a map of key to
+  // { value, segments }
+  function resultList(definitions, results) {
+    return definitions.map(function(def) {
       var r = results[def.key];
 
       return {
@@ -1302,6 +1331,57 @@ var AutoMeasure = (function() {
       };
     });
   }
+
+  // basic measurements: the girths at the bust, under bust, waist, abdomen,
+  // and hip levels
+
+  var BasicDefinitions = Definitions.filter(function(def) {
+    return ["bust", "underBust", "waist", "abdomen", "hip"].indexOf(def.key) >= 0;
+  });
+
+  var BasicLandmarkNames = {
+    bust: "Bust level",
+    underBust: "Under bust level",
+    waist: "Waist level",
+    abdomen: "Abdomen level",
+    hip: "Hip level"
+  };
+
+  function measureBasic(sliceMesh, lm) {
+    var results = {};
+
+    BasicDefinitions.forEach(function(def) {
+      var path = null;
+
+      try { path = girthAt(sliceMesh, lm[def.key].z); }
+      catch (e) { }
+
+      results[def.key] = path ? { value: path.length, segments: path.segments } : null;
+    });
+
+    return resultList(BasicDefinitions, results);
+  }
+
+  // the sets of measurements: each has its own landmarks, measurements, and
+  // report layout
+  var Modes = {
+    full: {
+      key: "full",
+      name: "Full",
+      definitions: Definitions,
+      landmarkNames: LandmarkNames,
+      findLandmarks: findLandmarks,
+      measure: measure
+    },
+    basic: {
+      key: "basic",
+      name: "Basic",
+      definitions: BasicDefinitions,
+      landmarkNames: BasicLandmarkNames,
+      findLandmarks: findBasicLandmarks,
+      measure: measureBasic
+    }
+  };
 
 
 
@@ -1317,11 +1397,18 @@ var AutoMeasure = (function() {
   // params:
   //  name: report name (e.g. customer or job)
   //  filename: scan filename
-  //  results: from measure()
+  //  results: from the mode's measure()
   //  images: array of { name, url } views of the model
+  //  mode: "full" (default) or "basic"; the basic report has one row of
+  //   girths across the top
   function reportHTML(params) {
     var date = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
+    var basic = params.mode === "basic";
     var groups = [];
+
+    function cm(result) {
+      return result.value === null ? "&ndash;" : (result.value / 10).toFixed(1);
+    }
 
     params.results.forEach(function(result) {
       var group = groups.length > 0 && groups[groups.length - 1].name === result.group ?
@@ -1337,14 +1424,20 @@ var AutoMeasure = (function() {
 
     var tables = groups.map(function(group) {
       var rows = group.rows.map(function(result) {
-        var value = result.value === null ? "&ndash;" : (result.value / 10).toFixed(1);
-
-        return "<tr><td>" + escapeHTML(result.name) + "</td><td class=\"value\">" + value + "</td></tr>";
+        return "<tr><td>" + escapeHTML(result.name) + "</td><td class=\"value\">" + cm(result) + "</td></tr>";
       }).join("");
 
       return "<table><thead><tr><th>" + escapeHTML(group.name) + "</th><th class=\"value\">cm</th></tr></thead>" +
         "<tbody>" + rows + "</tbody></table>";
     }).join("");
+
+    if (basic) {
+      tables = "<table class=\"row\"><thead><tr><th>Girths</th>" +
+        params.results.map(function(result) { return "<th>" + escapeHTML(result.name) + "</th>"; }).join("") +
+        "</tr></thead><tbody><tr><td class=\"unit\">cm</td>" +
+        params.results.map(function(result) { return "<td>" + cm(result) + "</td>"; }).join("") +
+        "</tr></tbody></table>";
+    }
 
     var images = params.images.map(function(image) {
       return "<figure><img src=\"" + image.url + "\" alt=\"" + escapeHTML(image.name) + " view\">" +
@@ -1352,9 +1445,13 @@ var AutoMeasure = (function() {
     }).join("");
 
     var title = params.name ? escapeHTML(params.name) : "Measurements";
+    var note = basic ?
+      "Girths are measured level, bridging hollows as a tape measure would. Blue: girths." :
+      "Girths are measured level, and lengths along the surface; both bridge hollows as a tape measure would. " +
+      "Blue: girths. Orange: lengths. L and R are the body's left and right.";
 
     return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
-      "<title>" + title + " - measurements</title>" +
+      "<title>" + title + " - " + (basic ? "basic " : "") + "measurements</title>" +
       "<style>" +
       "@page { size: A4 portrait; margin: 12mm; }" +
       "body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 0 auto; max-width: 190mm; padding: 8mm 0; }" +
@@ -1366,6 +1463,12 @@ var AutoMeasure = (function() {
       "th { text-align: left; border-bottom: 1px solid #111; padding: 3px 4px; }" +
       "td { border-bottom: 1px solid #ddd; padding: 3px 4px; }" +
       ".value { text-align: right; font-variant-numeric: tabular-nums; width: 18mm; }" +
+      ".tables.basic { columns: 1; }" +
+      "table.row { font-size: 15px; }" +
+      "table.row th, table.row td { text-align: center; }" +
+      "table.row th:first-child { text-align: left; }" +
+      "table.row td { font-size: 18px; font-weight: bold; font-variant-numeric: tabular-nums; }" +
+      "table.row td.unit { text-align: left; font-size: 13px; font-weight: normal; color: #444; }" +
       ".views { display: flex; justify-content: space-between; gap: 4mm; margin-top: 2mm; break-inside: avoid; }" +
       "figure { margin: 0; flex: 1; text-align: center; }" +
       "figure img { width: 100%; border: 1px solid #ddd; }" +
@@ -1375,10 +1478,9 @@ var AutoMeasure = (function() {
       "</style></head><body>" +
       "<header><h1>" + title + "</h1><div class=\"meta\">" + date +
       (params.filename ? "<br>Scan: " + escapeHTML(params.filename) : "") + "</div></header>" +
-      "<div class=\"tables\">" + tables + "</div>" +
+      "<div class=\"tables" + (basic ? " basic" : "") + "\">" + tables + "</div>" +
       "<div class=\"views\">" + images + "</div>" +
-      "<p class=\"note\">Girths are measured level, and lengths along the surface; both bridge hollows as a tape measure would. " +
-      "Blue: girths. Orange: lengths. L and R are the body's left and right.</p>" +
+      "<p class=\"note\">" + note + "</p>" +
       "</body></html>";
   }
 
@@ -1399,15 +1501,17 @@ var AutoMeasure = (function() {
   // corner of the scan's bounding box, so they still line up if the scan is
   // imported in a different place; the measurements are for reference only
   // params:
+  //  mode: "full" or "basic"
   //  name: report name
   //  filename: scan filename
   //  sliceMesh, landmarks, results
   function saveData(params) {
+    var mode = Modes[params.mode];
     var min = params.sliceMesh.min;
     var size = params.sliceMesh.max.clone().sub(min);
     var landmarks = {};
 
-    for (var key in LandmarkNames) {
+    for (var key in mode.landmarkNames) {
       var p = params.landmarks[key];
       if (!p) continue;
 
@@ -1417,6 +1521,7 @@ var AutoMeasure = (function() {
     return {
       format: FILE_FORMAT,
       version: FILE_VERSION,
+      mode: mode.key,
       saved: new Date().toISOString(),
       name: params.name || "",
       scan: params.filename || "",
@@ -1434,11 +1539,11 @@ var AutoMeasure = (function() {
     };
   }
 
-  // landmarks from saved data, placed on the given scan; any missing from the
-  // file are found automatically
+  // landmarks for the given mode ("full" or "basic") from saved data, placed
+  // on the given scan; any missing from the file are found automatically
   // returns { landmarks, name, scan, sizeDifference } where sizeDifference is
   // the largest difference in mm between the saved and current scan sizes
-  function loadData(sliceMesh, data) {
+  function loadData(sliceMesh, data, modeKey) {
     if (!data || data.format !== FILE_FORMAT || !data.landmarks) {
       throw new Error("This isn't an Auto Measure file.");
     }
@@ -1447,12 +1552,21 @@ var AutoMeasure = (function() {
       throw new Error("This file was saved by a newer version of Auto Measure.");
     }
 
+    var mode = Modes[modeKey];
+    // files saved before there was a basic mode are full
+    var fileMode = Modes[data.mode || "full"];
+
+    if (fileMode !== mode) {
+      throw new Error("This file has " + (fileMode ? fileMode.name.toLowerCase() : "unknown") +
+        " measurements" + (fileMode ? "; load it under Auto Measure " + fileMode.name : "") + ".");
+    }
+
     var min = sliceMesh.min;
     var size = sliceMesh.max.clone().sub(min);
     var landmarks = {};
     var missing = false;
 
-    for (var key in LandmarkNames) {
+    for (var key in mode.landmarkNames) {
       var p = data.landmarks[key];
 
       if (p && p.length === 3) {
@@ -1465,7 +1579,7 @@ var AutoMeasure = (function() {
     else missing = true;
 
     if (missing) {
-      var found = findLandmarks(sliceMesh);
+      var found = mode.findLandmarks(sliceMesh);
 
       for (var k in found) {
         if (landmarks[k] === undefined) landmarks[k] = found[k];
@@ -1500,6 +1614,7 @@ var AutoMeasure = (function() {
     saveData: saveData,
     loadData: loadData,
     tape: tape,
+    Modes: Modes,
     Definitions: Definitions,
     LandmarkNames: LandmarkNames
   };

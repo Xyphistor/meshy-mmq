@@ -186,14 +186,27 @@ Meshy.prototype.generateUI = function() {
   this.measureConvexHull = false;
   this.buildMeasurementFolder();
 
-  // automatic dressmaker's measurements
+  // automatic dressmaker's measurements: full, or basic (just the main
+  // girths); only one set is active at a time
   this.autoMeasure = null;
   this.autoMeasureValues = {};
   this.autoMeasureLandmark = "";
   this.autoMeasureShowTapes = true;
   this.autoMeasureName = "";
-  this.autoMeasureFolder = this.gui.addFolder("Auto Measure",
-    "Automatic dressmaker's measurements of an upright torso scan, front facing -y.");
+  this.autoMeasureFolders = {
+    full: this.gui.addFolder("Auto Measure Full",
+      "Automatic dressmaker's measurements of an upright torso scan, front facing -y."),
+    basic: this.gui.addFolder("Auto Measure Basic",
+      "Automatic bust, under bust, waist, abdomen, and hip girths of an upright torso scan, front facing -y.")
+  };
+  // per-set Measure and Load buttons for dat.gui
+  this.autoMeasureActions = {};
+  for (var modeKey in this.autoMeasureFolders) {
+    this.autoMeasureActions[modeKey] = {
+      run: this.autoMeasureRun.bind(this, modeKey),
+      load: this.autoMeasureLoad.bind(this, modeKey)
+    };
+  }
   this.buildAutoMeasureFolder();
 
   var thicknessFolder = this.gui.addFolder("Mesh Thickness", "Visualize approximate local mesh thickness.");
@@ -266,6 +279,12 @@ Meshy.prototype.generateUI = function() {
   this.gcodeCoordinatePrecision = 3;
   this.gcodeExtruderPrecision = 5;
   this.buildSupportSliceFolder();
+
+  // hidden rather than removed (other code still builds into them): not
+  // needed for measuring scans
+  [thicknessFolder, repairFolder, this.supportSliceFolder].forEach(function(folder) {
+    folder.domElement.parentNode.style.display = "none";
+  });
 
   this.gui.add(this, "undo").name("Undo")
     .title("Undo the last edit action.");
@@ -1454,34 +1473,48 @@ Meshy.prototype.addMeasurement = function(params) {
   this.onSetCurrentMeasurement();
 }
 Meshy.prototype.buildAutoMeasureFolder = function() {
-  this.clearFolder(this.autoMeasureFolder);
+  var am = this.autoMeasure;
 
-  this.autoMeasureFolder.add(this, "autoMeasureRun").name("Measure")
-    .title("Find the landmarks and measure the torso.");
-  this.autoMeasureFolder.add(this, "autoMeasureLoad").name("Load measurements")
-    .title("Load landmarks saved from this scan with Save measurements.");
+  for (var modeKey in this.autoMeasureFolders) {
+    var folder = this.autoMeasureFolders[modeKey];
+    var mode = AutoMeasure.Modes[modeKey];
+    var basic = modeKey === "basic";
 
-  if (!this.autoMeasure) return;
+    this.clearFolder(folder);
 
-  var landmarks = { "(choose)": "" };
-  for (var key in AutoMeasure.LandmarkNames) {
-    landmarks[AutoMeasure.LandmarkNames[key]] = key;
+    folder.add(this.autoMeasureActions[modeKey], "run").name("Measure")
+      .title(basic ?
+        "Find the girth levels and measure the bust, under bust, waist, abdomen, and hip." :
+        "Find the landmarks and measure the torso.");
+    folder.add(this.autoMeasureActions[modeKey], "load").name("Load measurements")
+      .title("Load " + mode.name.toLowerCase() + " measurements saved from this scan with Save measurements.");
+
+    // the rest only for the active set
+    if (!am || am.mode !== mode) continue;
+
+    var landmarks = { "(choose)": "" };
+    for (var key in mode.landmarkNames) {
+      landmarks[mode.landmarkNames[key]] = key;
+    }
+
+    folder.add(this, "autoMeasureLandmark", landmarks).name(basic ? "Move level" : "Move landmark")
+      .title(basic ?
+        "Choose a level, then click on the model at the height it should be." :
+        "Choose a landmark, then click on the model where it should be.")
+      .onChange(this.onAutoMeasureLandmark.bind(this));
+    folder.add(this, "autoMeasureShowTapes").name("Show tapes")
+      .title("Show the tapes for each measurement on the model.")
+      .onChange(this.autoMeasureDraw.bind(this));
+    folder.add(this, "autoMeasureName").name("Report name")
+      .title("Name shown on the report, e.g. the customer or job.");
+    folder.add(this, "autoMeasurePrintReport").name("Print report")
+      .title("Open a printable report of the measurements in cm.");
+    folder.add(this, "autoMeasureSave").name("Save measurements")
+      .title("Save the " + (basic ? "levels" : "landmarks") +
+        " and measurements to a file, to load again later with this scan.");
+    folder.add(this, "autoMeasureClear").name("Clear")
+      .title("Remove the automatic measurements.");
   }
-
-  this.autoMeasureFolder.add(this, "autoMeasureLandmark", landmarks).name("Move landmark")
-    .title("Choose a landmark, then click on the model where it should be.")
-    .onChange(this.onAutoMeasureLandmark.bind(this));
-  this.autoMeasureFolder.add(this, "autoMeasureShowTapes").name("Show tapes")
-    .title("Show the tapes for each measurement on the model.")
-    .onChange(this.autoMeasureDraw.bind(this));
-  this.autoMeasureFolder.add(this, "autoMeasureName").name("Report name")
-    .title("Name shown on the report, e.g. the customer or job.");
-  this.autoMeasureFolder.add(this, "autoMeasurePrintReport").name("Print report")
-    .title("Open a printable report of the measurements in cm.");
-  this.autoMeasureFolder.add(this, "autoMeasureSave").name("Save measurements")
-    .title("Save the landmarks and measurements to a file, to load again later with this scan.");
-  this.autoMeasureFolder.add(this, "autoMeasureClear").name("Clear")
-    .title("Remove the automatic measurements.");
 }
 // returns true if the model can be measured, else warns
 Meshy.prototype.autoMeasureCanMeasure = function() {
@@ -1497,37 +1530,42 @@ Meshy.prototype.autoMeasureCanMeasure = function() {
 
   return true;
 }
-Meshy.prototype.autoMeasureRun = function() {
+// measure the model with the given set of measurements ("full" or "basic")
+Meshy.prototype.autoMeasureRun = function(modeKey) {
   if (!this.autoMeasureCanMeasure()) return;
 
+  var mode = AutoMeasure.Modes[modeKey];
   var sliceMesh, landmarks;
 
   try {
     sliceMesh = new AutoMeasure.SliceMesh(this.model.getMesh());
-    landmarks = AutoMeasure.findLandmarks(sliceMesh);
+    landmarks = mode.findLandmarks(sliceMesh);
   }
   catch (e) {
     this.printout.error(e.message);
     return;
   }
 
-  this.autoMeasureStart(sliceMesh, landmarks);
+  this.autoMeasureStart(sliceMesh, landmarks, mode);
 
-  this.printout.log("Measured. Choose a landmark under Move landmark to adjust it.");
+  this.printout.log(modeKey === "basic" ?
+    "Measured. Choose a level under Move level to adjust it." :
+    "Measured. Choose a landmark under Move landmark to adjust it.");
 }
 // set up the measurements from the given landmarks
-Meshy.prototype.autoMeasureStart = function(sliceMesh, landmarks) {
+Meshy.prototype.autoMeasureStart = function(sliceMesh, landmarks, mode) {
   this.autoMeasureClear();
 
   this.autoMeasure = {
+    mode: mode,
     sliceMesh: sliceMesh,
     landmarks: landmarks,
     results: null,
-    list: this.infoBox.addList("autoMeasure", "Auto measurements (cm)", 0xffa040)
+    list: this.infoBox.addList("autoMeasure", "Auto Measure " + mode.name + " (cm)", 0xffa040)
   };
 
   var list = this.autoMeasure.list;
-  AutoMeasure.Definitions.forEach(function(def) {
+  mode.definitions.forEach(function(def) {
     list.add(def.name, this, ["autoMeasureValues", def.key]);
   }, this);
 
@@ -1542,6 +1580,7 @@ Meshy.prototype.autoMeasureSave = function() {
   if (!am) return;
 
   var data = AutoMeasure.saveData({
+    mode: am.mode.key,
     name: this.autoMeasureName,
     filename: this.filename,
     sliceMesh: am.sliceMesh,
@@ -1549,8 +1588,9 @@ Meshy.prototype.autoMeasureSave = function() {
     results: am.results
   });
 
+  // e.g. <report name>_basic_measurements.json
   var base = (this.autoMeasureName || this.filename || "scan").replace(/\.(obj|stl)$/i, "");
-  var fname = base.replace(/[\\\/:*?"<>|]/g, "_") + " measurements.json";
+  var fname = base.replace(/[\\\/:*?"<>|]/g, "_") + "_" + am.mode.key + "_measurements.json";
   var blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
   var url = URL.createObjectURL(blob);
   var a = document.createElement("a");
@@ -1566,8 +1606,9 @@ Meshy.prototype.autoMeasureSave = function() {
 
   this.printout.log("Saved " + fname + ".");
 }
-// choose a JSON file saved by autoMeasureSave and load it onto the model
-Meshy.prototype.autoMeasureLoad = function() {
+// choose a JSON file saved by autoMeasureSave and load it onto the model with
+// the given set of measurements ("full" or "basic")
+Meshy.prototype.autoMeasureLoad = function(modeKey) {
   if (!this.autoMeasureCanMeasure()) return;
 
   var _this = this;
@@ -1580,15 +1621,16 @@ Meshy.prototype.autoMeasureLoad = function() {
     input.onchange = function() {
       var file = this.files[0];
       this.value = "";
-      if (file) _this.autoMeasureLoadFile(file);
+      if (file) _this.autoMeasureLoadFile(file, _this.autoMeasureLoadMode);
     };
     document.body.appendChild(input);
     this.autoMeasureFileInput = input;
   }
 
+  this.autoMeasureLoadMode = modeKey;
   this.autoMeasureFileInput.click();
 }
-Meshy.prototype.autoMeasureLoadFile = function(file) {
+Meshy.prototype.autoMeasureLoadFile = function(file, modeKey) {
   var _this = this;
   var reader = new FileReader();
 
@@ -1599,7 +1641,7 @@ Meshy.prototype.autoMeasureLoadFile = function(file) {
 
     try {
       sliceMesh = new AutoMeasure.SliceMesh(_this.model.getMesh());
-      loaded = AutoMeasure.loadData(sliceMesh, JSON.parse(reader.result));
+      loaded = AutoMeasure.loadData(sliceMesh, JSON.parse(reader.result), modeKey);
     }
     catch (e) {
       _this.printout.error("Couldn't load " + file.name + ": " + e.message);
@@ -1608,7 +1650,7 @@ Meshy.prototype.autoMeasureLoadFile = function(file) {
 
     if (loaded.name) _this.autoMeasureName = loaded.name;
 
-    _this.autoMeasureStart(sliceMesh, loaded.landmarks);
+    _this.autoMeasureStart(sliceMesh, loaded.landmarks, AutoMeasure.Modes[modeKey]);
 
     if (loaded.sizeDifference > 2) {
       _this.printout.warn("These measurements were saved from a scan of a different size (by up to " +
@@ -1628,7 +1670,7 @@ Meshy.prototype.autoMeasureUpdate = function() {
   var am = this.autoMeasure;
   if (!am) return;
 
-  am.results = AutoMeasure.measure(am.sliceMesh, am.landmarks);
+  am.results = am.mode.measure(am.sliceMesh, am.landmarks);
 
   var values = {};
   am.results.forEach(function(result) {
@@ -1696,7 +1738,7 @@ Meshy.prototype.onAutoMeasureLandmark = function() {
     return;
   }
 
-  this.printout.log("Click on the model to place: " + AutoMeasure.LandmarkNames[key] + ".");
+  this.printout.log("Click on the model to place: " + this.autoMeasure.mode.landmarkNames[key] + ".");
 
   pointer.addCallback("autoMeasure", function(intersection) {
     _this.autoMeasure.landmarks[key] = intersection.point.clone();
@@ -1735,6 +1777,7 @@ Meshy.prototype.autoMeasurePrintReport = function() {
   if (!am) return;
 
   var html = AutoMeasure.reportHTML({
+    mode: am.mode.key,
     name: this.autoMeasureName,
     filename: this.filename,
     results: am.results,
@@ -2749,6 +2792,8 @@ Meshy.prototype.delete = function() {
 
   this.removeAllMeasurements();
   this.autoMeasureClear();
+  // the next scan is probably for someone else
+  this.autoMeasureName = "";
   this.endSetBase();
 
   this.editStack.clear();
