@@ -320,8 +320,14 @@ var AutoMeasure = (function() {
   // closed loops of the section of the mesh by a plane, largest first; each
   // is { chain, points, area, centroid, min, max }
   function sectionLoops(sliceMesh, plane) {
-    var chains = Calculate.chainsFromSegments(sliceMesh.segments(plane));
-    var basis = planeBasis(plane.normal);
+    return loopsFromSegments(sliceMesh.segments(plane), plane.normal);
+  }
+
+  // closed loops from the segments of a section by a plane with the given
+  // normal, largest first
+  function loopsFromSegments(segments, normal) {
+    var chains = Calculate.chainsFromSegments(segments);
+    var basis = planeBasis(normal);
     var loops = [];
 
     for (var c = 0; c < chains.length; c++) {
@@ -1402,6 +1408,8 @@ var AutoMeasure = (function() {
   //  results: from the mode's measure(), or an empty array
   //  measurements: other measurements, as an array of { name, value, unit }
   //   where unit is "cm" or "°"
+  //  cover: cover measurements (stretchy), as an array of { name, value }
+  //   where value is in mm, or null
   //  images: array of { name, url } views of the model
   function reportHTML(params) {
     var date = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
@@ -1454,6 +1462,14 @@ var AutoMeasure = (function() {
       }), listClass);
     }
 
+    var cover = params.cover || [];
+
+    if (cover.length > 0) {
+      tables += table("Cover Measurements (Stretchy)", cover.map(function(row) {
+        return { name: row.name, value: cm(row) };
+      }), listClass);
+    }
+
     var images = params.images.map(function(image) {
       return "<figure><img src=\"" + image.url + "\" alt=\"" + escapeHTML(image.name) + " view\">" +
         "<figcaption>" + escapeHTML(image.name) + "</figcaption></figure>";
@@ -1464,6 +1480,11 @@ var AutoMeasure = (function() {
       "Circumferences are measured level, and lengths along the surface; both bridge hollows as a tape measure would. " +
       "Blue: circumferences. Orange: lengths. L and R are the body's left and right." :
       basic ? "Circumferences are measured level, bridging hollows as a tape measure would." : "";
+
+    if (cover.length > 0) {
+      note += (note ? " " : "") + "Cover measurements follow the surface into hollows, at the height above the base shown, totalled around all parts (e.g. both legs); " +
+        "the neck sections are parallel to the neck cut, at the height of their highest point.";
+    }
 
     return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
       "<title>" + title + " - measurements</title>" +
@@ -1504,6 +1525,10 @@ var AutoMeasure = (function() {
     measure: measure,
     reportHTML: reportHTML,
     tape: tape,
+    sectionLoops: sectionLoops,
+    loopsFromSegments: loopsFromSegments,
+    closedLength: closedLength,
+    closedSegments: closedSegments,
     Modes: Modes,
     Definitions: Definitions,
     LandmarkNames: LandmarkNames

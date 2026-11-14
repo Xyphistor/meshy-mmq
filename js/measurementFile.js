@@ -12,6 +12,10 @@
 //  bounding box, so they still line up if the scan is imported in a
 //  different place; the values are stored for reference only
 //
+//  the cover measurements are saved as the heights of their levels above the
+//  base and, for the neck sections, the neck cut plane and their depths
+//  below it
+//
 //  also reads the version 1 files saved by Auto Measure, which only have the
 //  automatic measurement landmarks
 //
@@ -21,6 +25,7 @@
 //    scan: "scan.obj",
 //    min: modelMin, size: modelSize,
 //    autoMeasure: { mode: "basic", landmarks: landmarks }, // or null
+//    cover: coverState, // from CoverMeasure.find, or null
 //    measurements: [{ name, type, axis, convexHull, nearestContour, points }],
 //    values: [{ group, name, value, unit }]
 //  });
@@ -63,6 +68,7 @@ var MeasurementFile = (function() {
   //  scan: scan filename
   //  min, size: the scan's bounding box minimum and size, in mm
   //  autoMeasure: { mode, landmarks } or null; landmarks include midX
+//  cover: the cover measurements' state (see CoverMeasure.find) or null
   //  measurements: array of { name, type, axis, convexHull, nearestContour,
   //   points }
   //  values: array of { group, name, value, unit }, for reference
@@ -95,6 +101,7 @@ var MeasurementFile = (function() {
       units: "mm",
       scanSize: [round(size.x, 2), round(size.y, 2), round(size.z, 2)],
       autoMeasure: autoMeasure,
+      cover: params.cover ? createCover(params.cover, min) : null,
       measurements: params.measurements.map(function(m) {
         var saved = { name: m.name };
 
@@ -110,6 +117,47 @@ var MeasurementFile = (function() {
     };
   }
 
+  function createCover(cover, min) {
+    var neck = cover.neck;
+
+    return {
+      // heights above the base of the scan
+      levels: cover.levels.map(function(level) { return round(level.z - min.z, 2); }),
+      neck: neck ? {
+        cutNormal: [round(neck.cut.normal.x, 6), round(neck.cut.normal.y, 6), round(neck.cut.normal.z, 6)],
+        cutCentre: relative(neck.cut.centroid, min),
+        top: round(neck.top, 2),
+        base: round(neck.base, 2)
+      } : null
+    };
+  }
+
+  function readCover(cover, min) {
+    if (!cover || !Array.isArray(cover.levels)) return null;
+
+    var neck = null;
+    var n = cover.neck;
+
+    if (n && Array.isArray(n.cutNormal) && n.cutNormal.length === 3) {
+      var normal = new Vector3(n.cutNormal[0], n.cutNormal[1], n.cutNormal[2]).normalize();
+      var centroid = absolute(n.cutCentre, min);
+
+      if (centroid && typeof n.top === "number" && typeof n.base === "number") {
+        neck = {
+          cut: { normal: normal, offset: normal.dot(centroid), centroid: centroid },
+          top: n.top,
+          base: n.base
+        };
+      }
+    }
+
+    return {
+      levels: cover.levels.filter(function(h) { return typeof h === "number"; })
+        .map(function(h) { return h + min.z; }),
+      neck: neck
+    };
+  }
+
   // a saved set placed on the scan with the given bounding box minimum and
   // size
   // returns {
@@ -117,6 +165,7 @@ var MeasurementFile = (function() {
   //  sizeDifference: largest difference in mm between the saved and current
   //   scan sizes,
   //  autoMeasure: { mode, landmarks } or null; landmarks may be incomplete,
+  //  cover: { levels: [z], neck: { cut, top, base } or null } or null,
   //  measurements: array of { name, type, axis, convexHull, nearestContour,
   //   points }
   // }
@@ -178,6 +227,7 @@ var MeasurementFile = (function() {
       scan: data.scan || "",
       sizeDifference: sizeDifference,
       autoMeasure: autoMeasure,
+      cover: data.format === FORMAT ? readCover(data.cover, min) : null,
       measurements: measurements
     };
   }

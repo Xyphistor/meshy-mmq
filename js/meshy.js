@@ -207,6 +207,17 @@ Meshy.prototype.generateUI = function() {
   }
   this.buildAutoMeasureFolder();
 
+  // cover measurements (stretchy): circumferences around the surface every
+  // 5cm up the model, and at the top and base of the neck
+  this.cover = null;
+  this.coverValues = {};
+  this.coverLevel = "";
+  this.coverLevelValue = 0;
+  this.coverShowTapes = true;
+  this.coverFolder = this.gui.addFolder("Cover Measurements (Stretchy)",
+    "Circumferences around the surface every 5cm up the model, and at the top and base of the neck, for a stretchy cover.");
+  this.buildCoverFolder();
+
   // the report and saved files cover all the measurements shown: automatic
   // and manual
   this.reportName = "";
@@ -1723,9 +1734,10 @@ Meshy.prototype.saveMeasurements = function() {
   }
 
   var am = this.autoMeasure;
+  var cover = this.cover;
   var items = this.measuredItems();
 
-  if (!am && items.length === 0) {
+  if (!am && !cover && items.length === 0) {
     this.printout.warn("There are no measurements to save.");
     return;
   }
@@ -1745,6 +1757,17 @@ Meshy.prototype.saveMeasurements = function() {
     });
   }
 
+  if (cover) {
+    cover.rows.forEach(function(row) {
+      values.push({
+        group: "Cover (Stretchy)",
+        name: _this.coverRowLabel(row),
+        value: row.value === null ? null : round(row.value / 10),
+        unit: "cm"
+      });
+    });
+  }
+
   items.forEach(function(item) {
     var summary = _this.measurementSummary(item);
 
@@ -1757,6 +1780,7 @@ Meshy.prototype.saveMeasurements = function() {
     min: this.model.getMin(),
     size: this.model.getSize(),
     autoMeasure: am ? { mode: am.mode.key, landmarks: am.landmarks } : null,
+    cover: cover ? cover.state : null,
     measurements: items.map(function(item) {
       var params = item.measurement.getParams();
 
@@ -1811,7 +1835,7 @@ Meshy.prototype.loadMeasurementsFile = function(file) {
   reader.onload = function() {
     if (!_this.autoMeasureCanMeasure()) return;
 
-    var read, mode = null, sliceMesh = null, landmarks = null;
+    var read, mode = null, sliceMesh = null, landmarks = null, coverState = null;
 
     try {
       read = MeasurementFile.read(JSON.parse(reader.result), _this.model.getMin(), _this.model.getSize());
@@ -1835,6 +1859,16 @@ Meshy.prototype.loadMeasurementsFile = function(file) {
           }
         }
       }
+
+      if (read.cover) {
+        sliceMesh = sliceMesh || new AutoMeasure.SliceMesh(_this.model.getMesh());
+        coverState = {
+          base: sliceMesh.min.z,
+          top: sliceMesh.max.z,
+          levels: read.cover.levels.map(function(z, i) { return { id: "L" + i, z: z }; }),
+          neck: read.cover.neck
+        };
+      }
     }
     catch (e) {
       _this.printout.error("Couldn't load " + file.name + ": " + e.message);
@@ -1843,9 +1877,11 @@ Meshy.prototype.loadMeasurementsFile = function(file) {
 
     // replace the measurements shown
     _this.autoMeasureClear();
+    _this.coverClear();
     _this.removeAllMeasurements();
 
     if (mode) _this.autoMeasureStart(sliceMesh, landmarks, mode);
+    if (coverState) _this.coverStart(sliceMesh, coverState);
 
     var types = Object.keys(Measurement.Types).map(function(k) { return Measurement.Types[k]; });
 
@@ -1983,6 +2019,346 @@ Meshy.prototype.autoMeasureClear = function() {
   this.autoMeasureValues = {};
   this.buildAutoMeasureFolder();
 }
+// cover measurements (stretchy)
+
+Meshy.prototype.buildCoverFolder = function() {
+  var folder = this.coverFolder;
+  var cover = this.cover;
+
+  this.clearFolder(folder);
+
+  folder.add(this, "coverRun").name("Measure")
+    .title("Measure the circumferences every 5cm from the base up, and at the top and base of the neck, parallel to the neck cut.");
+
+  if (!cover) return;
+
+  var levels = { "(choose)": "" };
+  cover.rows.forEach(function(row) {
+    var label = this.coverRowLabel(row);
+
+    while (levels.hasOwnProperty(label)) label += " ";
+    levels[label] = row.key;
+  }, this);
+
+  folder.add(this, "coverLevel", levels).name("Move level")
+    .title("Choose a level, then click on the model where it should be, or type its height.")
+    .onChange(this.onCoverLevel.bind(this));
+
+  if (this.coverLevel) {
+    var neck = this.coverIsNeck(this.coverLevel);
+
+    folder.add(this, "coverLevelValue").name(neck ? "Below cut (cm)" : "Height (cm)").step(0.1)
+      .title(neck ?
+        "Distance of this section below the neck cut, at right angles to the cut, in cm." :
+        "Height of this level above the base of the model, in cm.")
+      .onFinishChange(this.setCoverLevelValue.bind(this));
+  }
+
+  folder.add(this, "coverShowTapes").name("Show tapes")
+    .title("Show the tapes for each measurement on the model.")
+    .onChange(this.coverDraw.bind(this));
+  folder.add(this, "coverCopy").name("Copy for Excel")
+    .title("Copy the heights and circumferences in cm, from the top down, as two columns to paste into a spreadsheet.");
+  folder.add(this, "coverClear").name("Clear")
+    .title("Remove the cover measurements.");
+}
+Meshy.prototype.coverIsNeck = function(key) {
+  return key === "neckTop" || key === "neckBase";
+}
+// e.g. "85.0 cm" or "96.2 cm (neck top)": the height above the base, which
+// for the neck sections is that of their highest point
+Meshy.prototype.coverRowLabel = function(row) {
+  var neck = row.kind === "neckTop" ? "neck top" : row.kind === "neckBase" ? "neck base" : null;
+
+  if (row.height === null) return "Not found (" + neck + ")";
+
+  return (row.height / 10).toFixed(1) + " cm" + (neck ? " (" + neck + ")" : "");
+}
+Meshy.prototype.coverRun = function() {
+  if (!this.autoMeasureCanMeasure()) return;
+
+  var sliceMesh, state;
+
+  try {
+    sliceMesh = new AutoMeasure.SliceMesh(this.model.getMesh());
+    state = CoverMeasure.find(sliceMesh);
+  }
+  catch (e) {
+    this.printout.error(e.message);
+    return;
+  }
+
+  this.coverStart(sliceMesh, state);
+
+  if (state.neck) {
+    this.printout.log("Measured. Choose a level under Move level to adjust it.");
+  }
+  else {
+    this.printout.warn("Measured, but there's no flat cut across the top of the neck, so there are no neck measurements. " +
+      "Add them under Measure if needed.");
+  }
+}
+Meshy.prototype.coverStart = function(sliceMesh, state) {
+  this.coverClear();
+
+  this.cover = {
+    sliceMesh: sliceMesh,
+    state: state,
+    rows: [],
+    excluded: [],
+    list: null
+  };
+
+  if (!this.reportName) this.setReportName(this.scanName());
+
+  this.coverUpdate();
+}
+// remeasure from the current levels
+Meshy.prototype.coverUpdate = function() {
+  var cover = this.cover;
+  if (!cover) return;
+
+  var result = CoverMeasure.measure(cover.sliceMesh, cover.state);
+
+  cover.rows = result.rows;
+  cover.excluded = result.excluded;
+
+  // the labels change with the heights, so remake the list
+  if (cover.list) this.infoBox.removeList(cover.list);
+  cover.list = this.infoBox.addList("cover", "Cover (Stretchy): height, circumference (cm)", 0x30b070);
+
+  var values = {};
+  cover.rows.forEach(function(row) {
+    values[row.key] = row.value === null ? "-" : (row.value / 10).toFixed(1);
+    cover.list.add(this.coverRowLabel(row), this, ["coverValues", row.key]);
+  }, this);
+  this.coverValues = values;
+  cover.list.update();
+
+  // a level that's been moved into the neck is left out
+  if (this.coverLevel && !this.coverRow(this.coverLevel)) {
+    this.printout.warn("That level cuts into the neck, so it's left out.");
+    this.coverEndMove();
+    return;
+  }
+
+  this.buildCoverFolder();
+  this.coverDraw();
+}
+Meshy.prototype.coverRow = function(key) {
+  var rows = this.cover ? this.cover.rows : [];
+
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].key === key) return rows[i];
+  }
+
+  return null;
+}
+Meshy.prototype.coverDraw = function() {
+  this.coverRemoveMarkers();
+
+  var cover = this.cover;
+  if (!cover) return;
+
+  var scene = this.scene;
+  var selected = this.coverLevel;
+  var showTapes = this.coverShowTapes;
+
+  cover.rows.forEach(function(row) {
+    if (row.segments.length === 0) return;
+    if (!showTapes && row.key !== selected) return;
+
+    var color = row.key === selected ? 0xffcc00 : row.kind === "level" ? 0x20a060 : 0x9040ff;
+    var marker = Markers.create(Markers.Types.contour, { name: "coverMarker", color: color });
+
+    marker.setFromSegments(row.segments);
+    marker.activate();
+    marker.addToScene(scene);
+  });
+}
+Meshy.prototype.coverRemoveMarkers = function() {
+  for (var i = this.scene.children.length - 1; i >= 0; i--) {
+    if (this.scene.children[i].name === "coverMarker") {
+      this.scene.remove(this.scene.children[i]);
+    }
+  }
+}
+// the value in the Height or Below cut field for a level: cm above the base,
+// or for the neck sections cm below the cut
+Meshy.prototype.coverGetLevelValue = function(key) {
+  var state = this.cover.state;
+
+  if (key === "neckTop") return Math.round(state.neck.top) / 10;
+  if (key === "neckBase") return Math.round(state.neck.base) / 10;
+
+  for (var i = 0; i < state.levels.length; i++) {
+    if (state.levels[i].id === key) return Math.round(state.levels[i].z - state.base) / 10;
+  }
+
+  return 0;
+}
+Meshy.prototype.onCoverLevel = function() {
+  var key = this.coverLevel;
+  var _this = this;
+
+  if (!key) {
+    this.coverEndMove();
+    return;
+  }
+
+  this.coverLevelValue = this.coverGetLevelValue(key);
+
+  this.printout.log("Click on the model where " + this.coverRowLabel(this.coverRow(key)) + " should be, or type its " +
+    (this.coverIsNeck(key) ? "distance below the cut." : "height."));
+
+  this.pointer.addCallback("coverMeasure", function(intersection) {
+    _this.coverMoveLevel(key, intersection.point);
+  });
+  this.pointer.activate();
+
+  // rebuilding the folder from its own controller's change handler upsets
+  // dat.gui
+  setTimeout(function() {
+    _this.buildCoverFolder();
+    _this.coverDraw();
+  });
+}
+// move a level to the height of a point, or a neck section to the plane
+// parallel to the cut through the point
+Meshy.prototype.coverMoveLevel = function(key, point) {
+  var state = this.cover.state;
+
+  if (this.coverIsNeck(key)) {
+    this.coverSetLevel(key, CoverMeasure.depthOf(state.neck.cut, point));
+  }
+  else {
+    this.coverSetLevel(key, point.z - state.base);
+  }
+}
+// set a level's height above the base, or a neck section's depth below the
+// cut, in mm
+Meshy.prototype.coverSetLevel = function(key, value) {
+  var state = this.cover.state;
+
+  if (this.coverIsNeck(key)) {
+    state.neck[key === "neckTop" ? "top" : "base"] = Math.max(value, 0.5);
+  }
+  else {
+    var z = Math.min(Math.max(state.base + value, state.base + 0.5), state.top - 0.5);
+
+    state.levels.forEach(function(level) {
+      if (level.id === key) level.z = z;
+    });
+  }
+
+  this.coverLevelValue = this.coverGetLevelValue(key);
+  this.coverUpdate();
+}
+Meshy.prototype.setCoverLevelValue = function() {
+  if (!this.cover || !this.coverLevel) return;
+
+  var key = this.coverLevel;
+  var value = this.coverLevelValue * 10;
+  var _this = this;
+
+  setTimeout(function() { _this.coverSetLevel(key, value); });
+}
+Meshy.prototype.coverEndMove = function() {
+  var pointer = this.pointer;
+
+  // only turn the pointer off if nothing else is using it
+  if (pointer.removeCallback("coverMeasure") && Object.keys(pointer.callbacks).length === 0) {
+    pointer.deactivate();
+  }
+
+  this.coverLevel = "";
+  this.buildCoverFolder();
+  this.coverDraw();
+}
+Meshy.prototype.coverClear = function() {
+  if (this.cover) {
+    if (this.cover.list) this.infoBox.removeList(this.cover.list);
+    this.cover = null;
+    this.coverEndMove();
+  }
+
+  this.coverRemoveMarkers();
+  this.coverValues = {};
+  this.buildCoverFolder();
+}
+// copy the cover measurements as tab-separated text, which pastes into a
+// spreadsheet as two columns, and show it in case copying isn't allowed
+Meshy.prototype.coverCopy = function() {
+  if (!this.cover) {
+    this.printout.warn("Measure first.");
+    return;
+  }
+
+  var text = CoverMeasure.tableText(this.cover.rows);
+  var printout = this.printout;
+
+  var overlay = document.createElement("div");
+  overlay.style.cssText = "position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.7);" +
+    "display:flex;align-items:center;justify-content:center;";
+
+  var box = document.createElement("div");
+  box.style.cssText = "background:#fff;color:#111;padding:14px;border-radius:4px;font:13px Arial,sans-serif;" +
+    "display:flex;flex-direction:column;gap:8px;max-height:90vh;";
+
+  var heading = document.createElement("div");
+  heading.textContent = "Height and circumference (cm), from the top down. Paste into a spreadsheet.";
+
+  var area = document.createElement("textarea");
+  area.value = text;
+  area.readOnly = true;
+  area.rows = Math.min(30, this.cover.rows.length + 1);
+  area.style.cssText = "width:260px;font:13px monospace;tab-size:10;resize:vertical;";
+
+  var status = document.createElement("div");
+  status.style.cssText = "color:#286;min-height:1em;";
+
+  var toolbar = document.createElement("div");
+  toolbar.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
+
+  function copy() {
+    function copied() {
+      status.textContent = "Copied.";
+      printout.log("Copied the cover measurements.");
+    }
+
+    area.focus();
+    area.select();
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(copied, function() {
+        if (document.execCommand("copy")) copied();
+        else status.textContent = "Couldn't copy: select the text and copy it with Ctrl+C.";
+      });
+    }
+    else if (document.execCommand("copy")) copied();
+    else status.textContent = "Couldn't copy: select the text and copy it with Ctrl+C.";
+  }
+
+  function button(label, onClick) {
+    var b = document.createElement("button");
+    b.textContent = label;
+    b.style.cssText = "padding:6px 18px;font-size:14px;cursor:pointer;";
+    b.onclick = onClick;
+    toolbar.appendChild(b);
+  }
+
+  button("Copy", copy);
+  button("Close", function() { document.body.removeChild(overlay); });
+
+  box.appendChild(heading);
+  box.appendChild(area);
+  box.appendChild(status);
+  box.appendChild(toolbar);
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  copy();
+}
 // show a printable report of all the measurements shown
 Meshy.prototype.printReport = function() {
   if (!this.model) {
@@ -1991,9 +2367,10 @@ Meshy.prototype.printReport = function() {
   }
 
   var am = this.autoMeasure;
+  var cover = this.cover;
   var items = this.measuredItems();
 
-  if (!am && items.length === 0) {
+  if (!am && !cover && items.length === 0) {
     this.printout.warn("There are no measurements to report.");
     return;
   }
@@ -2004,6 +2381,9 @@ Meshy.prototype.printReport = function() {
     mode: am ? am.mode.key : null,
     results: am ? am.results : [],
     measurements: items.map(this.measurementSummary.bind(this)),
+    cover: cover ? cover.rows.map(function(row) {
+      return { name: this.coverRowLabel(row), value: row.value };
+    }, this) : [],
     images: this.captureReportViews()
   });
 
@@ -3029,6 +3409,7 @@ Meshy.prototype.delete = function() {
 
   this.removeAllMeasurements();
   this.autoMeasureClear();
+  this.coverClear();
   // the next scan is probably for someone else
   this.setReportName("");
   this.endSetBase();
