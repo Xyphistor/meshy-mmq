@@ -1,0 +1,1240 @@
+// autoMeasure.js
+//
+// dependencies:
+//  three.js
+//  calculate.js
+//
+// description:
+//  automatic dressmaker's measurements of a body scan: finds landmarks and
+//  levels on the torso, then measures girths and lengths between them, as a
+//  tape measure would (bridging hollows, e.g. between the breasts)
+//
+//  assumes the scan is upright with +z up, the front of the body facing -y,
+//  and the body's left side toward +x; units are mm
+//
+// classes:
+//  AutoMeasure.SliceMesh
+//  constructor arguments:
+//   - mesh: THREE.Mesh to measure
+//
+// example:
+//  var mode = AutoMeasure.Modes.basic;
+//  var sliceMesh = new AutoMeasure.SliceMesh(mesh);
+//  var landmarks = mode.findLandmarks(sliceMesh);
+//
+//  /* optionally adjust landmark positions here */
+//
+//  var results = mode.measure(sliceMesh, landmarks);
+//
+//  results is an array of objects like
+//   { key, name, group, value, segments }
+//  where value is in mm (null if the measurement failed) and segments is an
+//  array of THREE.Line3 showing the tape
+//
+//  AutoMeasure.Modes holds the sets of measurements; Modes.basic is the bust,
+//  under bust, waist, abdomen, and hip girths. Other sets can be added with
+//  AutoMeasure.addMode
+
+
+
+var AutoMeasure = (function() {
+
+  var Vector3 = THREE.Vector3;
+  var Plane = THREE.Plane;
+  var Line3 = THREE.Line3;
+
+  var X = new Vector3(1, 0, 0);
+  var Y = new Vector3(0, 1, 0);
+  var Z = new Vector3(0, 0, 1);
+
+  // distance of a hint point from the body, used to pick which way around a
+  // cross-section a tape goes
+  var HINT_DISTANCE = 2000;
+
+  // spacing of the horizontal sections used to profile the body
+  var PROFILE_STEP = 5;
+
+
+
+  // SliceMesh: a triangle soup prepared for fast plane sections
+
+  function SliceMesh(mesh) {
+    var positions = [];
+
+    mesh.updateMatrixWorld();
+
+    Calculate.traverseFaces(mesh, function(va, vb, vc) {
+      positions.push(va.x, va.y, va.z, vb.x, vb.y, vb.z, vc.x, vc.y, vc.z);
+    });
+
+    var count = positions.length / 9;
+    var p = new Float64Array(positions);
+    var normals = new Float64Array(count * 3);
+    var zmin = new Float64Array(count);
+    var zmax = new Float64Array(count);
+
+    this.min = new Vector3(Infinity, Infinity, Infinity);
+    this.max = new Vector3(-Infinity, -Infinity, -Infinity);
+
+    for (var f = 0; f < count; f++) {
+      var o = f * 9;
+
+      // face normal from the winding order
+      var abx = p[o + 3] - p[o], aby = p[o + 4] - p[o + 1], abz = p[o + 5] - p[o + 2];
+      var acx = p[o + 6] - p[o], acy = p[o + 7] - p[o + 1], acz = p[o + 8] - p[o + 2];
+
+      normals[f * 3] = aby * acz - abz * acy;
+      normals[f * 3 + 1] = abz * acx - abx * acz;
+      normals[f * 3 + 2] = abx * acy - aby * acx;
+
+      zmin[f] = Math.min(p[o + 2], p[o + 5], p[o + 8]);
+      zmax[f] = Math.max(p[o + 2], p[o + 5], p[o + 8]);
+
+      for (var v = 0; v < 9; v += 3) {
+        this.min.x = Math.min(this.min.x, p[o + v]);
+        this.min.y = Math.min(this.min.y, p[o + v + 1]);
+        this.min.z = Math.min(this.min.z, p[o + v + 2]);
+        this.max.x = Math.max(this.max.x, p[o + v]);
+        this.max.y = Math.max(this.max.y, p[o + v + 1]);
+        this.max.z = Math.max(this.max.z, p[o + v + 2]);
+      }
+    }
+
+    this.count = count;
+    this.positions = p;
+    this.normals = normals;
+
+    // bucket faces by height so that horizontal sections only test the faces
+    // that can cross them; stored as offsets into a flat array of face indices
+    var bucketSize = 2;
+    var bucketCount = Math.floor((this.max.z - this.min.z) / bucketSize) + 1;
+    var offsets = new Int32Array(bucketCount + 1);
+
+    for (var f = 0; f < count; f++) {
+      var b0 = Math.floor((zmin[f] - this.min.z) / bucketSize);
+      var b1 = Math.floor((zmax[f] - this.min.z) / bucketSize);
+
+      for (var b = b0; b <= b1; b++) offsets[b + 1]++;
+    }
+
+    for (var b = 0; b < bucketCount; b++) offsets[b + 1] += offsets[b];
+
+    var fill = offsets.slice(0, bucketCount);
+    var items = new Int32Array(offsets[bucketCount]);
+
+    for (var f = 0; f < count; f++) {
+      var b0 = Math.floor((zmin[f] - this.min.z) / bucketSize);
+      var b1 = Math.floor((zmax[f] - this.min.z) / bucketSize);
+
+      for (var b = b0; b <= b1; b++) items[fill[b]++] = f;
+    }
+
+    this.bucketSize = bucketSize;
+    this.bucketCount = bucketCount;
+    this.bucketOffsets = offsets;
+    this.bucketItems = items;
+  }
+
+  Object.assign(SliceMesh.prototype, {
+
+    // intersect the mesh with a plane; returns an array of THREE.Line3,
+    // oriented like Calculate.crossSection's segments (wound CCW about the
+    // plane normal around the outside of the mesh)
+    segments: function(plane) {
+      var n = plane.normal;
+      var segments = [];
+
+      // horizontal plane: only test faces in the relevant bucket
+      if (Math.abs(n.x) < 1e-12 && Math.abs(n.y) < 1e-12) {
+        var z = -plane.constant / n.z;
+        var b = Math.floor((z - this.min.z) / this.bucketSize);
+
+        if (b < 0 || b >= this.bucketCount) return segments;
+
+        var offsets = this.bucketOffsets;
+        var items = this.bucketItems;
+
+        for (var i = offsets[b], l = offsets[b + 1]; i < l; i++) {
+          this.intersectFace(items[i], n, plane.constant, segments);
+        }
+      }
+      else {
+        for (var f = 0, l = this.count; f < l; f++) {
+          this.intersectFace(f, n, plane.constant, segments);
+        }
+      }
+
+      return segments;
+    },
+
+    // find a flat plate on one side of the body (e.g. an armhole plate on a
+    // dress form) between heights z0 and z1; sign is 1 for the left (+x)
+    // side, -1 for the right; returns { top, bottom } or null if no plate
+    flatSide: function(sign, z0, z1) {
+      var p = this.positions;
+      var normals = this.normals;
+      var faces = [];
+
+      for (var f = 0; f < this.count; f++) {
+        var o = f * 9;
+        var cz = (p[o + 2] + p[o + 5] + p[o + 8]) / 3;
+
+        if (cz < z0 || cz > z1) continue;
+
+        var nx = normals[f * 3], ny = normals[f * 3 + 1], nz = normals[f * 3 + 2];
+        var len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+
+        if (len === 0 || nx * sign / len < 0.8) continue;
+
+        faces.push({
+          f: f,
+          area: len / 2,
+          normal: new Vector3(nx / len, ny / len, nz / len),
+          center: new Vector3(
+            (p[o] + p[o + 3] + p[o + 6]) / 3,
+            (p[o + 1] + p[o + 4] + p[o + 7]) / 3,
+            cz
+          )
+        });
+      }
+
+      // fit a plane to the faces, then keep only the faces lying in it,
+      // tightening the tolerance each time
+      var plateNormal = new Vector3(sign, 0, 0);
+      var offset = null;
+      var tolerances = [0.8, 0.98, 0.995];
+
+      for (var t = 0; t < tolerances.length; t++) {
+        faces = faces.filter(function(face) {
+          return face.normal.dot(plateNormal) > tolerances[t] &&
+            (offset === null || Math.abs(face.center.dot(plateNormal) - offset) < 3);
+        });
+
+        if (faces.length === 0) return null;
+
+        var sumNormal = new Vector3();
+        var sumOffset = 0;
+        var sumArea = 0;
+
+        // the plate is the outermost flat part of the side, so weight toward
+        // the faces furthest out
+        var outermost = Math.max.apply(null, faces.map(function(face) { return face.center.x * sign; }));
+
+        faces = faces.filter(function(face) { return face.center.x * sign > outermost - 30; });
+
+        faces.forEach(function(face) {
+          sumNormal.addScaledVector(face.normal, face.area);
+          sumArea += face.area;
+        });
+
+        plateNormal = sumNormal.normalize();
+
+        faces.forEach(function(face) {
+          sumOffset += face.center.dot(plateNormal) * face.area;
+        });
+
+        offset = sumOffset / sumArea;
+      }
+
+      // too small to be an armhole plate
+      if (sumArea < 2000) return null;
+
+      var top = null;
+      var bottom = null;
+
+      faces.forEach(function(face) {
+        var o = face.f * 9;
+
+        for (var v = 0; v < 9; v += 3) {
+          var vertex = new Vector3(p[o + v], p[o + v + 1], p[o + v + 2]);
+
+          if (top === null || vertex.z > top.z) top = vertex;
+          if (bottom === null || vertex.z < bottom.z) bottom = vertex;
+        }
+      });
+
+      return { top: top, bottom: bottom };
+    },
+
+    intersectFace: function(f, n, constant, segments) {
+      var p = this.positions;
+      var o = f * 9;
+
+      var d0 = n.x * p[o] + n.y * p[o + 1] + n.z * p[o + 2] + constant;
+      var d1 = n.x * p[o + 3] + n.y * p[o + 4] + n.z * p[o + 5] + constant;
+      var d2 = n.x * p[o + 6] + n.y * p[o + 7] + n.z * p[o + 8] + constant;
+
+      // treat points on the plane as above it so that every crossing is
+      // counted exactly once
+      var s0 = d0 >= 0, s1 = d1 >= 0, s2 = d2 >= 0;
+
+      if (s0 === s1 && s1 === s2) return;
+
+      var points = [];
+
+      if (s0 !== s1) points.push(edgePoint(p, o, o + 3, d0, d1));
+      if (s1 !== s2) points.push(edgePoint(p, o + 3, o + 6, d1, d2));
+      if (s2 !== s0) points.push(edgePoint(p, o + 6, o, d2, d0));
+
+      var a = points[0];
+      var b = points[1];
+
+      if (a.equals(b)) return;
+
+      // orient the segment so that the face normal points to its right, as
+      // seen from the plane normal
+      var fx = this.normals[f * 3], fy = this.normals[f * 3 + 1], fz = this.normals[f * 3 + 2];
+      var dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+      var cx = dy * n.z - dz * n.y;
+      var cy = dz * n.x - dx * n.z;
+      var cz = dx * n.y - dy * n.x;
+
+      if (fx * cx + fy * cy + fz * cz < 0) segments.push(new Line3(b, a));
+      else segments.push(new Line3(a, b));
+    }
+
+  });
+
+  // point where the edge between two vertices crosses the plane, computed
+  // from the vertices in a fixed order so that the two faces sharing the edge
+  // produce exactly the same point
+  function edgePoint(p, i, j, di, dj) {
+    if (p[i] > p[j] || (p[i] === p[j] && (p[i + 1] > p[j + 1] ||
+        (p[i + 1] === p[j + 1] && p[i + 2] > p[j + 2])))) {
+      var ti = i; i = j; j = ti;
+      var td = di; di = dj; dj = td;
+    }
+
+    var t = di / (di - dj);
+
+    return new Vector3(
+      p[i] + (p[j] - p[i]) * t,
+      p[i + 1] + (p[j + 1] - p[i + 1]) * t,
+      p[i + 2] + (p[j + 2] - p[i + 2]) * t
+    );
+  }
+
+
+
+  // sections and loops
+
+  // closed loops of the section of the mesh by a plane, largest first; each
+  // is { chain, points, area, centroid, min, max }
+  function sectionLoops(sliceMesh, plane) {
+    return loopsFromSegments(sliceMesh.segments(plane), plane.normal);
+  }
+
+  // closed loops from the segments of a section by a plane with the given
+  // normal, largest first
+  function loopsFromSegments(segments, normal) {
+    var chains = Calculate.chainsFromSegments(segments);
+    var basis = planeBasis(normal);
+    var loops = [];
+
+    for (var c = 0; c < chains.length; c++) {
+      var chain = chains[c];
+
+      if (!chain.closed || chain.points.length < 3) continue;
+
+      var loop = loopInfo(chain, basis);
+
+      // holes (wound the other way) are not part of the outside surface
+      if (loop.area > 0) loops.push(loop);
+    }
+
+    loops.sort(function(a, b) { return b.area - a.area; });
+
+    return loops;
+  }
+
+  // two unit vectors spanning the plane with the given normal, such that
+  // u x v = normal
+  function planeBasis(normal) {
+    var u = Math.abs(normal.z) < 0.9 ? new Vector3().crossVectors(Z, normal) : new Vector3().crossVectors(normal, X);
+    u.normalize();
+
+    var v = new Vector3().crossVectors(normal, u).normalize();
+
+    return { u: u, v: v, normal: normal };
+  }
+
+  function loopInfo(chain, basis) {
+    var points = chain.points;
+    var n = points.length;
+    var area = 0;
+    var cu = 0, cv = 0;
+    var min = new Vector3(Infinity, Infinity, Infinity);
+    var max = new Vector3(-Infinity, -Infinity, -Infinity);
+
+    for (var i = 0; i < n; i++) {
+      var a = points[i];
+      var b = points[(i + 1) % n];
+      var au = a.dot(basis.u), av = a.dot(basis.v);
+      var bu = b.dot(basis.u), bv = b.dot(basis.v);
+      var cross = au * bv - bu * av;
+
+      area += cross;
+      cu += (au + bu) * cross;
+      cv += (av + bv) * cross;
+
+      min.min(a);
+      max.max(a);
+    }
+
+    area /= 2;
+
+    var centroid = new Vector3();
+
+    if (area !== 0) {
+      cu /= 6 * area;
+      cv /= 6 * area;
+
+      // the offset of the plane along its normal is the same for all points
+      var w = points[0].dot(basis.normal);
+
+      centroid.copy(basis.u).multiplyScalar(cu)
+        .addScaledVector(basis.v, cv)
+        .addScaledVector(basis.normal, w);
+    }
+
+    return {
+      chain: chain,
+      points: points,
+      area: area,
+      centroid: centroid,
+      min: min,
+      max: max,
+      basis: basis
+    };
+  }
+
+  // convex hull of a loop in its plane, as an array of 3D points in CCW order
+  function loopHull(loop) {
+    var basis = loop.basis;
+    var pts = loop.points.map(function(p) {
+      return { u: p.dot(basis.u), v: p.dot(basis.v), p: p };
+    });
+
+    pts.sort(function(a, b) { return a.u - b.u || a.v - b.v; });
+
+    function cross(o, a, b) {
+      return (a.u - o.u) * (b.v - o.v) - (a.v - o.v) * (b.u - o.u);
+    }
+
+    // Andrew's monotone chain
+    var lower = [];
+    for (var i = 0; i < pts.length; i++) {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], pts[i]) <= 0) lower.pop();
+      lower.push(pts[i]);
+    }
+
+    var upper = [];
+    for (var i = pts.length - 1; i >= 0; i--) {
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], pts[i]) <= 0) upper.pop();
+      upper.push(pts[i]);
+    }
+
+    lower.pop();
+    upper.pop();
+
+    return lower.concat(upper).map(function(h) { return h.p; });
+  }
+
+  function closedLength(points) {
+    var length = 0;
+
+    for (var i = 0, n = points.length; i < n; i++) {
+      length += points[i].distanceTo(points[(i + 1) % n]);
+    }
+
+    return length;
+  }
+
+  function closedSegments(points) {
+    var segments = [];
+
+    for (var i = 0, n = points.length; i < n; i++) {
+      segments.push(new Line3(points[i], points[(i + 1) % n]));
+    }
+
+    return segments;
+  }
+
+  function horizontalPlane(z) {
+    return new Plane(Z.clone(), -z);
+  }
+
+  // the largest loop in the horizontal section at height z
+  function torsoLoop(sliceMesh, z) {
+    var loops = sectionLoops(sliceMesh, horizontalPlane(z));
+
+    return loops.length > 0 ? loops[0] : null;
+  }
+
+  // the closest point on a closed loop to the given point, or null
+  function nearestOnLoop(loop, point) {
+    if (!loop) return null;
+
+    var points = loop.points;
+    var n = points.length;
+    var best = null;
+    var bestDist = Infinity;
+
+    for (var i = 0; i < n; i++) {
+      var p = new Line3(points[i], points[(i + 1) % n]).closestPointToPoint(point, true, new Vector3());
+      var d = p.distanceToSquared(point);
+
+      if (d < bestDist) {
+        bestDist = d;
+        best = p;
+      }
+    }
+
+    return best;
+  }
+
+  // points where a closed loop crosses the line through the given point in
+  // the given direction (both in the plane of the loop), sorted along the
+  // direction
+  function loopCrossings(loop, point, direction) {
+    var normal = loop.basis.normal;
+    // the line is the intersection of the loop's plane and the plane through
+    // point with this normal
+    var lineNormal = new Vector3().crossVectors(direction, normal).normalize();
+    var offset = lineNormal.dot(point);
+    var points = loop.points;
+    var n = points.length;
+    var crossings = [];
+
+    for (var i = 0; i < n; i++) {
+      var a = points[i];
+      var b = points[(i + 1) % n];
+      var da = lineNormal.dot(a) - offset;
+      var db = lineNormal.dot(b) - offset;
+
+      if ((da >= 0) === (db >= 0)) continue;
+
+      crossings.push(a.clone().lerp(b, da / (da - db)));
+    }
+
+    crossings.sort(function(a, b) { return a.dot(direction) - b.dot(direction); });
+
+    return crossings;
+  }
+
+  // the first or last crossing of a loop by a line, or null
+  function firstCrossing(loop, point, direction) {
+    var crossings = loop ? loopCrossings(loop, point, direction) : [];
+
+    return crossings.length > 0 ? crossings[0] : null;
+  }
+
+  // index of the point furthest from the line through a and b on the side of
+  // the given direction; returns -1 if no point is on that side
+  function cornerIndex(points, a, b, side) {
+    var chord = new Vector3().subVectors(b, a);
+    var chordLength = chord.length();
+
+    if (chordLength === 0) return -1;
+
+    chord.divideScalar(chordLength);
+
+    // component of the side direction perpendicular to the chord
+    var perp = side.clone().addScaledVector(chord, -side.dot(chord)).normalize();
+    var best = -1;
+    var bestDist = 0;
+
+    for (var i = 0; i < points.length; i++) {
+      var d = new Vector3().subVectors(points[i], a).dot(perp);
+
+      if (d > bestDist) {
+        bestDist = d;
+        best = i;
+      }
+    }
+
+    return best;
+  }
+
+  // points along a profile line: the first crossing of the section loop by a
+  // line in the given direction at each height in [z0, z1]
+  function profilePoints(loop, x, direction, z0, z1, step) {
+    var points = [];
+
+    if (!loop) return points;
+
+    for (var z = Math.min(z0, z1); z <= Math.max(z0, z1); z += step) {
+      var p = firstCrossing(loop, new Vector3(x, 0, z), direction);
+
+      if (p) points.push(p);
+    }
+
+    return points;
+  }
+
+  // the tape from start to end, in the plane through both points that also
+  // contains the given direction, going around the given side of the body;
+  // pulled taut over hollows unless taut is false
+  // returns { points, segments, length } or null
+  function tape(sliceMesh, start, end, direction, side, taut) {
+    if (!start || !end) return null;
+
+    var chord = new Vector3().subVectors(end, start);
+    var normal = new Vector3().crossVectors(chord, direction);
+
+    if (normal.lengthSq() < 1e-12) return null;
+
+    normal.normalize();
+
+    var plane = new Plane().setFromNormalAndCoplanarPoint(normal, start);
+    var chains = Calculate.chainsFromSegments(sliceMesh.segments(plane));
+
+    if (chains.length === 0) return null;
+
+    // a point on the right side: where the line through the middle of the
+    // chord, perpendicular to it, leaves the surface on that side
+    var mid = start.clone().add(end).multiplyScalar(0.5);
+    var perp = new Vector3().crossVectors(normal, chord).normalize();
+
+    if (perp.dot(side) < 0) perp.negate();
+
+    var via = outermostCrossing(nearestChain(chains, start), mid, perp, chord.clone().normalize());
+
+    if (!via) via = mid.clone().addScaledVector(perp, HINT_DISTANCE);
+
+    return Calculate.pathOnChains(chains, normal, start, via, end, taut !== false);
+  }
+
+  // the chain with the closest point to the given point
+  function nearestChain(chains, point) {
+    var best = null;
+    var bestDist = Infinity;
+
+    for (var c = 0; c < chains.length; c++) {
+      var points = chains[c].points;
+
+      for (var i = 0; i < points.length; i++) {
+        var d = points[i].distanceToSquared(point);
+
+        if (d < bestDist) {
+          bestDist = d;
+          best = chains[c];
+        }
+      }
+    }
+
+    return best;
+  }
+
+  // the furthest point in the given direction where a chain crosses the line
+  // through origin in that direction (the origin may be outside the surface,
+  // e.g. on a chord across a hollow); along is a unit vector in the chain's
+  // plane perpendicular to the line
+  function outermostCrossing(chain, origin, direction, along) {
+    var points = chain.points;
+    var n = points.length;
+    var segmentCount = chain.closed ? n : n - 1;
+    var best = null;
+    var bestT = -Infinity;
+
+    for (var i = 0; i < segmentCount; i++) {
+      var a = points[i];
+      var b = points[(i + 1) % n];
+      var da = new Vector3().subVectors(a, origin).dot(along);
+      var db = new Vector3().subVectors(b, origin).dot(along);
+
+      if ((da >= 0) === (db >= 0)) continue;
+
+      var p = a.clone().lerp(b, da / (da - db));
+      var t = new Vector3().subVectors(p, origin).dot(direction);
+
+      if (t > bestT) {
+        bestT = t;
+        best = p;
+      }
+    }
+
+    return best;
+  }
+
+
+
+  // landmark detection
+
+  // horizontal sections of the body at regular heights
+  function profile(sliceMesh) {
+    var levels = [];
+
+    for (var z = sliceMesh.min.z + PROFILE_STEP / 2; z < sliceMesh.max.z; z += PROFILE_STEP) {
+      var loops = sectionLoops(sliceMesh, horizontalPlane(z));
+
+      if (loops.length === 0) continue;
+
+      var loop = loops[0];
+
+      levels.push({
+        z: z,
+        loop: loop,
+        girth: closedLength(loopHull(loop)),
+        width: loop.max.x - loop.min.x,
+        // area of the second-largest loop relative to the largest
+        secondRatio: loops.length > 1 ? loops[1].area / loop.area : 0
+      });
+    }
+
+    return levels;
+  }
+
+  function levelsBetween(levels, z0, z1) {
+    return levels.filter(function(l) { return l.z >= z0 && l.z <= z1; });
+  }
+
+  function extremeLevel(levels, key, wantMax) {
+    var best = null;
+
+    for (var i = 0; i < levels.length; i++) {
+      if (best === null || (wantMax ? levels[i][key] > best[key] : levels[i][key] < best[key])) {
+        best = levels[i];
+      }
+    }
+
+    return best;
+  }
+
+  function median(values) {
+    var sorted = values.slice().sort(function(a, b) { return a - b; });
+
+    return sorted.length > 0 ? sorted[Math.floor(sorted.length / 2)] : 0;
+  }
+
+  // find the levels of the torso: crotch, shoulders, underarms, bust points,
+  // under bust, waist, and hip; returns an object with the profile levels,
+  // the midline x coordinate (midX), the underarm and bust points, and the
+  // heights, or throws if the scan can't be analyzed
+  function findLevels(sliceMesh) {
+    var levels = profile(sliceMesh);
+
+    if (levels.length < 10) throw new Error("Couldn't find the body in the scan.");
+
+    var zBottom = sliceMesh.min.z;
+    var zTop = sliceMesh.max.z;
+    var height = zTop - zBottom;
+
+    // crotch: highest level in the lower part of the body where the legs form
+    // two similar loops; the bottom of the scan if the legs aren't separate
+    var zCrotch = zBottom;
+    var lower = levelsBetween(levels, zBottom, zBottom + 0.55 * height);
+
+    for (var i = 0; i < lower.length; i++) {
+      if (lower[i].secondRatio > 0.3) zCrotch = lower[i].z;
+    }
+
+    // hip width, for scale
+    var hipZone = levelsBetween(levels, zCrotch + 20, zCrotch + 0.3 * (zTop - zCrotch));
+    var hipWidth = extremeLevel(hipZone.length ? hipZone : levels, "width", true).width;
+
+    // shoulders: going down from the top, the first level that's wide
+    // compared to the hips; everything above is the neck (and head)
+    var zShoulder = zTop;
+
+    for (var i = levels.length - 1; i >= 0; i--) {
+      if (levels[i].width >= 0.6 * hipWidth) {
+        zShoulder = levels[i].z;
+        break;
+      }
+    }
+
+    // body midline
+    var midX = median(levelsBetween(levels, zCrotch + 50, zShoulder - 100).map(function(l) {
+      return l.loop.centroid.x;
+    }));
+
+    var torsoLength = zShoulder - zCrotch;
+
+    // underarms, searching the upper half of the torso
+    var zUpper = zCrotch + 0.5 * torsoLength;
+    var underarm = findUnderarms(levels, zUpper, zShoulder, midX);
+
+    if (!underarm) throw new Error("Couldn't find the underarms.");
+
+    // dress forms usually have flat armhole plates: the underarm is the bottom
+    // of the plate and the shoulder point is the top
+    var plateL = null, plateR = null;
+
+    if (!underarm.hasArms) {
+      plateL = sliceMesh.flatSide(1, zUpper, zShoulder);
+      plateR = sliceMesh.flatSide(-1, zUpper, zShoulder);
+
+      if (plateL) underarm.left = plateL.bottom;
+      if (plateR) underarm.right = plateR.bottom;
+    }
+
+    var zUnderarm = (underarm.left.z + underarm.right.z) / 2;
+
+    // bust points: on each side, going down from the underarms, the first
+    // forward peak that's followed by the crease under the bust (so a tummy
+    // further down isn't mistaken for the bust)
+    var bustZone = levelsBetween(levels, zUnderarm - 0.35 * (zUnderarm - zCrotch), zUnderarm - PROFILE_STEP);
+    var maxOffset = 0.45 * hipWidth;
+
+    function bustPoint(sign) {
+      var peak = null;
+
+      for (var i = bustZone.length - 1; i >= 0; i--) {
+        var points = bustZone[i].loop.points;
+        var levelFront = null;
+
+        for (var j = 0; j < points.length; j++) {
+          var dx = (points[j].x - midX) * sign;
+
+          if (dx < 30 || dx > maxOffset) continue;
+
+          if (levelFront === null || points[j].y < levelFront.y) levelFront = points[j];
+        }
+
+        if (levelFront === null) continue;
+
+        if (peak === null || levelFront.y < peak.y) peak = levelFront;
+        // the surface has turned back in under the bust
+        else if (levelFront.y > peak.y + 5) break;
+      }
+
+      return peak ? peak.clone() : null;
+    }
+
+    var bustL = bustPoint(1);
+    var bustR = bustPoint(-1);
+
+    if (!bustL || !bustR) throw new Error("Couldn't find the bust points.");
+
+    var zBust = (bustL.z + bustR.z) / 2;
+
+    // hip: fullest level in the lower half of the body between crotch and bust
+    var hipLevel = extremeLevel(levelsBetween(levels, zCrotch + 30, zCrotch + 0.55 * (zBust - zCrotch)), "girth", true);
+
+    if (!hipLevel) throw new Error("Couldn't find the hip.");
+
+    var zHip = hipLevel.z;
+
+    var back = new Vector3(0, 1, 0);
+
+    // under bust: the crease under each breast, i.e. the front profile point
+    // through the bust point furthest behind the line from the bust point down
+    // to the hip
+    var underBustZ = [];
+
+    [bustL, bustR].forEach(function(bust) {
+      var loop = sectionLoops(sliceMesh, new Plane(X.clone(), -bust.x))[0];
+      if (!loop) return;
+
+      var points = profilePoints(loop, bust.x, back, zHip, bust.z, 2);
+      var hipFront = firstCrossing(loop, new Vector3(bust.x, 0, zHip), back);
+      if (!hipFront) return;
+
+      var idx = cornerIndex(points, bust, hipFront, back);
+      if (idx >= 0) underBustZ.push(points[idx].z);
+    });
+
+    var zUnderBust = underBustZ.length > 0 ?
+      underBustZ.reduce(function(a, b) { return a + b; }) / underBustZ.length :
+      zBust - 0.2 * (zBust - zHip);
+
+    // waist: narrowest level between the under bust and the hip, keeping
+    // clear of the under bust crease (on some figures the body keeps getting
+    // narrower right up to the crease)
+    var span = zUnderBust - zHip;
+    var waistLevel = extremeLevel(levelsBetween(levels, zHip + 0.3 * span, zUnderBust - 0.2 * span), "girth", false);
+
+    if (!waistLevel) throw new Error("Couldn't find the waist.");
+
+    var zWaist = waistLevel.z;
+
+    return {
+      levels: levels,
+      midX: midX,
+      hipWidth: hipWidth,
+      zCrotch: zCrotch,
+      zShoulder: zShoulder,
+      underarm: underarm,
+      plateL: plateL,
+      plateR: plateR,
+      zUnderarm: zUnderarm,
+      bustL: bustL,
+      bustR: bustR,
+      zBust: zBust,
+      zHip: zHip,
+      zUnderBust: zUnderBust,
+      zWaist: zWaist
+    };
+  }
+
+  // level landmarks are shown at the front of the body on the midline
+  function levelPoint(sliceMesh, midX, z) {
+    var loop = torsoLoop(sliceMesh, z);
+    var p = loop ? firstCrossing(loop, new Vector3(midX, 0, z), Y) : null;
+
+    return p || new Vector3(midX, sliceMesh.min.y, z);
+  }
+
+  // landmarks for the basic measurements: just the girth levels
+  function findBasicLandmarks(sliceMesh) {
+    var found = findLevels(sliceMesh);
+    var midX = found.midX;
+
+    return {
+      midX: midX,
+      bust: levelPoint(sliceMesh, midX, found.zBust),
+      underBust: levelPoint(sliceMesh, midX, found.zUnderBust),
+      waist: levelPoint(sliceMesh, midX, found.zWaist),
+      abdomen: levelPoint(sliceMesh, midX, (found.zWaist + found.zHip) / 2),
+      hip: levelPoint(sliceMesh, midX, found.zHip)
+    };
+  }
+
+  // underarm points: for scans with arms, the top of the gap between arm and
+  // body; for armless forms, the bottom of the flat armhole plates
+  function findUnderarms(levels, zLow, zShoulder, midX) {
+    var zone = levelsBetween(levels, zLow, zShoulder);
+
+    if (zone.length < 3) return null;
+
+    // arms: going up from the bust, the body loop suddenly gets much wider
+    // where the arms join it
+    for (var i = 1; i < zone.length; i++) {
+      if (zone[i].width > 1.3 * zone[i - 1].width) {
+        var points = sidePoints(zone[i - 1].loop, midX);
+        points.hasArms = true;
+
+        return points;
+      }
+    }
+
+    // armless: the armhole plates are the widest part of the upper body; the
+    // underarm is the bottom of the run of levels that are nearly as wide
+    var result = { hasArms: false };
+
+    ["left", "right"].forEach(function(side) {
+      var sign = side === "left" ? 1 : -1;
+      var extent = zone.map(function(l) {
+        return sign > 0 ? l.loop.max.x : -l.loop.min.x;
+      });
+      var widest = 0;
+
+      for (var i = 1; i < extent.length; i++) {
+        if (extent[i] > extent[widest]) widest = i;
+      }
+
+      var bottom = widest;
+
+      while (bottom > 0 && extent[bottom - 1] >= extent[widest] - 3) bottom--;
+
+      result[side] = sidePoints(zone[bottom].loop, midX)[side];
+    });
+
+    return result;
+  }
+
+  // the outermost points of a loop on each side of the midline; where the side
+  // is flat (e.g. an armhole plate), the middle of the flat part
+  function sidePoints(loop, midX) {
+    function outermost(sign) {
+      var points = loop.points.filter(function(p) { return (p.x - midX) * sign > 0; });
+
+      if (points.length === 0) return null;
+
+      var extreme = Math.max.apply(null, points.map(function(p) { return p.x * sign; }));
+      var flat = points.filter(function(p) { return p.x * sign > extreme - 2; });
+      var meanY = flat.reduce(function(s, p) { return s + p.y; }, 0) / flat.length;
+      var best = flat[0];
+
+      for (var i = 1; i < flat.length; i++) {
+        if (Math.abs(flat[i].y - meanY) < Math.abs(best.y - meanY)) best = flat[i];
+      }
+
+      return best.clone();
+    }
+
+    return {
+      left: outermost(1),
+      right: outermost(-1)
+    };
+  }
+
+
+
+  // measurements
+
+  // horizontal girth at height z, bridging hollows
+  function girthAt(sliceMesh, z) {
+    var loop = torsoLoop(sliceMesh, z);
+    if (!loop) return null;
+
+    var hull = loopHull(loop);
+
+    return { length: closedLength(hull), segments: closedSegments(hull) };
+  }
+
+  // results in the order of the definitions, from a map of key to
+  // { value, segments }
+  function resultList(definitions, results) {
+    return definitions.map(function(def) {
+      var r = results[def.key];
+
+      return {
+        key: def.key,
+        name: def.name,
+        group: def.group,
+        value: r ? r.value : null,
+        segments: r ? r.segments : []
+      };
+    });
+  }
+  // basic measurements: the girths at the bust, under bust, waist, abdomen,
+  // and hip levels
+
+  var BasicDefinitions = [
+    { key: "bust", name: "Bust", group: "Circumferences" },
+    { key: "underBust", name: "Under bust", group: "Circumferences" },
+    { key: "waist", name: "Waist", group: "Circumferences" },
+    { key: "abdomen", name: "Abdomen", group: "Circumferences" },
+    { key: "hip", name: "Hip", group: "Circumferences" }
+  ];
+
+  var BasicLandmarkNames = {
+    bust: "Bust level",
+    underBust: "Under bust level",
+    waist: "Waist level",
+    abdomen: "Abdomen level",
+    hip: "Hip level"
+  };
+
+  function measureBasic(sliceMesh, lm) {
+    var results = {};
+
+    BasicDefinitions.forEach(function(def) {
+      var path = null;
+
+      try { path = girthAt(sliceMesh, lm[def.key].z); }
+      catch (e) { }
+
+      results[def.key] = path ? { value: path.length, segments: path.segments } : null;
+    });
+
+    return resultList(BasicDefinitions, results);
+  }
+
+  // the sets of measurements, by key: each has its own landmarks,
+  // measurements, menu text and report layout. A set is an object like
+  //  {
+  //    key, name,       // e.g. "basic", "Basic"; the menu folder is
+  //                     //  "Auto Measure " + name
+  //    order,           // menu position among the sets, lowest first
+  //    description,     // menu folder tooltip
+  //    measureTitle,    // Measure button tooltip
+  //    moveName,        // name and tooltip of the landmark chooser
+  //    moveTitle,
+  //    measuredMessage, // shown after measuring
+  //    reportLayout,    // "columns" (one table per group, in columns) or
+  //                     //  "lists" (side by side lists)
+  //    reportNote,      // note at the foot of the report
+  //    definitions,     // [{ key, name, group }] in report order
+  //    landmarkNames,   // { key: name } of the adjustable landmarks
+  //    findLandmarks,   // function(sliceMesh) -> landmarks, incl. midX
+  //    measure          // function(sliceMesh, landmarks) -> results
+  //  }
+  // more sets can be added with addMode
+  var Modes = {};
+  var modeOrder = [];
+
+  function addMode(mode) {
+    Modes[mode.key] = mode;
+
+    modeOrder = modeOrder.filter(function(m) { return m.key !== mode.key; });
+    modeOrder.push(mode);
+    modeOrder.sort(function(a, b) { return a.order - b.order; });
+  }
+
+  // the sets in menu order
+  function modeList() {
+    return modeOrder.slice();
+  }
+
+  addMode({
+    key: "basic",
+    name: "Basic",
+    order: 20,
+    description: "Automatic bust, under bust, waist, abdomen, and hip circumferences of an upright torso scan, front facing -y.",
+    measureTitle: "Find the levels and measure the bust, under bust, waist, abdomen, and hip circumferences.",
+    moveName: "Move level",
+    moveTitle: "Choose a level, then click on the model at the height it should be.",
+    measuredMessage: "Measured. Choose a level under Move level to adjust it.",
+    reportLayout: "lists",
+    reportNote: "Circumferences are measured level, bridging hollows as a tape measure would.",
+    definitions: BasicDefinitions,
+    landmarkNames: BasicLandmarkNames,
+    findLandmarks: findBasicLandmarks,
+    measure: measureBasic
+  });
+
+
+
+  // report
+
+  function escapeHTML(s) {
+    return String(s).replace(/[&<>"']/g, function(c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // printable HTML report of the measurements in cm
+  // params:
+  //  name: report name (e.g. customer or job)
+  //  filename: scan filename
+  //  mode: key of the set of automatic measurements, or null if there are
+  //   none
+  //  results: from the mode's measure(), or an empty array
+  //  measurements: other measurements, as an array of { name, value, unit }
+  //   where unit is "cm" or "°"
+  //  cover: cover measurements (stretchy), as an array of { name, value }
+  //   where value is in mm, or null
+  //  images: array of { name, url } views of the model
+  function reportHTML(params) {
+    var date = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
+    var mode = params.mode ? Modes[params.mode] || null : null;
+    var columns = mode !== null && mode.reportLayout === "columns";
+    var measurements = params.measurements || [];
+    var groups = [];
+
+    function cm(result) {
+      return result.value === null ? "&ndash;" : (result.value / 10).toFixed(1);
+    }
+
+    function table(heading, rows, className) {
+      return "<table" + (className ? " class=\"" + className + "\"" : "") + ">" +
+        "<thead><tr><th>" + escapeHTML(heading) + "</th><th class=\"value\">cm</th></tr></thead><tbody>" +
+        rows.map(function(row) {
+          return "<tr><td>" + escapeHTML(row.name) + "</td><td class=\"value\">" + row.value + "</td></tr>";
+        }).join("") +
+        "</tbody></table>";
+    }
+
+    params.results.forEach(function(result) {
+      var group = groups.length > 0 && groups[groups.length - 1].name === result.group ?
+        groups[groups.length - 1] : null;
+
+      if (!group) {
+        group = { name: result.group, rows: [] };
+        groups.push(group);
+      }
+
+      group.rows.push({ name: result.name, value: cm(result) });
+    });
+
+    // sets with many groups are in columns; others, and the other
+    // measurements, are side by side lists
+    var listClass = columns ? "" : "list";
+    var tables = groups.map(function(group) {
+      // the circumferences are the basic dimensions in every set
+      var heading = group.name === "Circumferences" ? "Basic Dimensions" : group.name;
+
+      return table(heading, group.rows, listClass);
+    }).join("");
+
+    if (measurements.length > 0) {
+      tables += table("Additional Measurements", measurements.map(function(m) {
+        var value = m.value === null || m.value === undefined ? "&ndash;" :
+          m.value.toFixed(1) + (m.unit === "cm" ? "" : escapeHTML(m.unit));
+
+        return { name: m.name, value: value };
+      }), listClass);
+    }
+
+    var cover = params.cover || [];
+
+    if (cover.length > 0) {
+      tables += table("Cover Measurements (Stretchy)", cover.map(function(row) {
+        return { name: row.name, value: cm(row) };
+      }), listClass);
+    }
+
+    var images = params.images.map(function(image) {
+      return "<figure><img src=\"" + image.url + "\" alt=\"" + escapeHTML(image.name) + " view\">" +
+        "<figcaption>" + escapeHTML(image.name) + "</figcaption></figure>";
+    }).join("");
+
+    var title = params.name ? escapeHTML(params.name) : "Measurements";
+    var note = mode ? mode.reportNote || "" : "";
+
+    if (cover.length > 0) {
+      note += (note ? " " : "") + "Cover measurements follow the surface into hollows, at the height above the base shown, totalled around all parts (e.g. both legs); " +
+        "the neck sections are parallel to the neck cut, at the height of their highest point.";
+    }
+
+    return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
+      "<title>" + title + " - measurements</title>" +
+      "<style>" +
+      "@page { size: A4 portrait; margin: 12mm; }" +
+      "body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 0 auto; max-width: 190mm; padding: 8mm 0; }" +
+      "header { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 2px solid #111; padding-bottom: 4px; }" +
+      "h1 { font-size: 20px; margin: 0; }" +
+      ".meta { font-size: 12px; color: #444; text-align: right; }" +
+      ".tables { columns: 2; column-gap: 10mm; margin-top: 6mm; }" +
+      "table { width: 100%; border-collapse: collapse; margin-bottom: 5mm; break-inside: avoid; font-size: 13px; }" +
+      "th { text-align: left; border-bottom: 1px solid #111; padding: 3px 4px; }" +
+      "td { border-bottom: 1px solid #ddd; padding: 3px 4px; }" +
+      ".value { text-align: right; font-variant-numeric: tabular-nums; width: 18mm; }" +
+      ".tables.lists { columns: auto; display: flex; flex-wrap: wrap; align-items: flex-start; gap: 0 10mm; }" +
+      "table.list { width: 90mm; font-size: 15px; }" +
+      "table.list td.value { font-weight: bold; }" +
+      ".views { display: flex; justify-content: space-between; gap: 4mm; margin-top: 2mm; break-inside: avoid; }" +
+      "figure { margin: 0; flex: 1; text-align: center; }" +
+      "figure img { width: 100%; border: 1px solid #ddd; }" +
+      "figcaption { font-size: 12px; color: #444; }" +
+      ".note { font-size: 11px; color: #555; margin-top: 4mm; }" +
+      "@media print { body { padding: 0; } }" +
+      "</style></head><body>" +
+      "<header><h1>" + title + "</h1><div class=\"meta\">" + date +
+      (params.filename ? "<br>Scan: " + escapeHTML(params.filename) : "") + "</div></header>" +
+      "<div class=\"tables" + (columns ? "" : " lists") + "\">" + tables + "</div>" +
+      "<div class=\"views\">" + images + "</div>" +
+      (note ? "<p class=\"note\">" + note + "</p>" : "") +
+      "</body></html>";
+  }
+
+
+
+  return {
+    SliceMesh: SliceMesh,
+    reportHTML: reportHTML,
+    tape: tape,
+    sectionLoops: sectionLoops,
+    loopsFromSegments: loopsFromSegments,
+    closedLength: closedLength,
+    closedSegments: closedSegments,
+    findLevels: findLevels,
+    Modes: Modes,
+    addMode: addMode,
+    modeList: modeList,
+
+    // building blocks for other sets of measurements
+    geometry: {
+      X: X,
+      Y: Y,
+      Z: Z,
+      PROFILE_STEP: PROFILE_STEP,
+      horizontalPlane: horizontalPlane,
+      torsoLoop: torsoLoop,
+      loopHull: loopHull,
+      nearestOnLoop: nearestOnLoop,
+      firstCrossing: firstCrossing,
+      cornerIndex: cornerIndex,
+      profilePoints: profilePoints,
+      levelsBetween: levelsBetween,
+      extremeLevel: extremeLevel,
+      levelPoint: levelPoint,
+      girthAt: girthAt,
+      resultList: resultList
+    }
+  };
+
+})();

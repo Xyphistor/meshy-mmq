@@ -590,37 +590,38 @@ var Calculate = (function() {
       if (segment !== null) segments.push(segment);
     });
 
-    var chains = _chainsFromSegments(segments);
-    var targets = [start, via, end];
+    return _pathOnChains(_chainsFromSegments(segments), normal, start, via, end, convexHull);
+  }
 
-    // find the chain closest to the three points and locate them on it
+  // given the chains forming a cross-section (from _chainsFromSegments) and
+  // the plane normal, find the path from start to end along the chain nearest
+  // to them, going the way around that passes closest to via; via need not be
+  // on the surface - any point on the correct side of the cross-section works
+  // returns an object like { points, segments, boundingBox, length, closed },
+  // or null if no path exists
+  function _pathOnChains(chains, normal, start, via, end, convexHull) {
+    // find the chain closest to the start and end and locate them on it
     var chain = null;
-    var locations = null;
+    var ls = null;
+    var le = null;
     var minDist = Infinity;
 
     for (var c = 0, lc = chains.length; c < lc; c++) {
-      var chainLocations = [];
-      var dist = 0;
-
-      for (var t = 0; t < 3; t++) {
-        var location = _locateOnChain(chains[c], targets[t]);
-
-        chainLocations.push(location);
-        dist += location.distance;
-      }
+      var startLocation = _locateOnChain(chains[c], start);
+      var endLocation = _locateOnChain(chains[c], end);
+      var dist = startLocation.distance + endLocation.distance;
 
       if (dist < minDist) {
         chain = chains[c];
-        locations = chainLocations;
+        ls = startLocation;
+        le = endLocation;
         minDist = dist;
       }
     }
 
     if (chain === null) return null;
 
-    var ls = locations[0];
-    var lv = locations[1];
-    var le = locations[2];
+    var lv = _locateOnChain(chain, via);
 
     // determine which way along the chain to go from start to end; on a
     // closed chain, go forward if the via point comes before the end point
@@ -1006,6 +1007,8 @@ var Calculate = (function() {
     nearestContourToPoints: _nearestContourToPoints,
     planarConvexHull: _planarConvexHull,
     surfacePath: _surfacePath,
+    pathOnChains: _pathOnChains,
+    chainsFromSegments: _chainsFromSegments,
     circleFromThreePoints: _circleFromThreePoints
   };
 

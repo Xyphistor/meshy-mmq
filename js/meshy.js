@@ -11,6 +11,8 @@
 // Constructor.
 Meshy = function() {
   this.units = Units.mm;
+  // measurements are shown in these units; the mesh itself stays in mm
+  this.displayUnits = Units.cm;
 
   // params
   this.buildVolumeSize = new THREE.Vector3(145, 145, 175);
@@ -186,6 +188,48 @@ Meshy.prototype.generateUI = function() {
   this.measureConvexHull = false;
   this.buildMeasurementFolder();
 
+  // automatic dressmaker's measurements: a menu folder for each set in
+  // AutoMeasure.Modes; only one set is active at a time
+  this.autoMeasure = null;
+  this.autoMeasureValues = {};
+  this.autoMeasureLandmark = "";
+  this.autoMeasureShowTapes = true;
+  this.autoMeasureFolders = {};
+  // per-set Measure buttons for dat.gui
+  this.autoMeasureActions = {};
+  AutoMeasure.modeList().forEach(function(mode) {
+    this.autoMeasureFolders[mode.key] = this.gui.addFolder("Auto Measure " + mode.name, mode.description);
+    this.autoMeasureActions[mode.key] = { run: this.autoMeasureRun.bind(this, mode.key) };
+  }, this);
+  this.buildAutoMeasureFolder();
+
+  // cover measurements (stretchy): circumferences around the surface every
+  // 5cm up the model, and at the top and base of the neck
+  this.cover = null;
+  this.coverValues = {};
+  this.coverLevel = "";
+  this.coverLevelValue = 0;
+  this.coverShowTapes = true;
+  this.coverFolder = this.gui.addFolder("Cover Measurements (Stretchy)",
+    "Circumferences around the surface every 5cm up the model, and at the top and base of the neck, for a stretchy cover.");
+  this.buildCoverFolder();
+
+  // the report and saved files cover all the measurements shown: automatic
+  // and manual
+  this.reportName = "";
+  var reportFolder = this.gui.addFolder("Report", "Printable report of all the measurements shown, in cm.");
+  this.reportNameController = reportFolder.add(this, "reportName").name("Report name")
+    .title("Name shown on the report and used for saved files, e.g. the customer or job.");
+  reportFolder.add(this, "printReport").name("Print report")
+    .title("Open a printable report of all the measurements shown, with front, side, and back views.");
+
+  var saveLoadFolder = this.gui.addFolder("Save/Load Measurements",
+    "Save all the measurements shown to a file, or load them back onto this scan.");
+  saveLoadFolder.add(this, "saveMeasurements").name("Save measurements")
+    .title("Save all the measurements shown (automatic and manual) to a file, to load again later with this scan.");
+  saveLoadFolder.add(this, "loadMeasurements").name("Load measurements")
+    .title("Load measurements saved from this scan, replacing the ones shown.");
+
   var thicknessFolder = this.gui.addFolder("Mesh Thickness", "Visualize approximate local mesh thickness.");
   this.thicknessThreshold = 1.0;
   thicknessFolder.add(this, "thicknessThreshold", 0).name("Threshold")
@@ -257,6 +301,12 @@ Meshy.prototype.generateUI = function() {
   this.gcodeExtruderPrecision = 5;
   this.buildSupportSliceFolder();
 
+  // hidden rather than removed (other code still builds into them): not
+  // needed for measuring scans
+  [thicknessFolder, repairFolder, this.supportSliceFolder].forEach(function(folder) {
+    folder.domElement.parentNode.style.display = "none";
+  });
+
   this.gui.add(this, "undo").name("Undo")
     .title("Undo the last edit action.");
   this.gui.add(this, "redo").name("Redo")
@@ -265,17 +315,20 @@ Meshy.prototype.generateUI = function() {
     .title("Delete the mesh.");
 
   this.infoBox = new InfoBox(this.displayPrecision);
-  this.infoBox.add("Units", this, "units");
+  var d = this.displayFactor();
+  this.infoBox.add("Units", this, "displayUnits");
   this.infoBox.add("Polycount", this, ["model","getPolyCount"]);
   this.infoBox.add("Vertex count", this, ["model","getVertexCount"]);
-  this.infoBox.add("x range", this, ["model","getXRange"]);
-  this.infoBox.add("y range", this, ["model","getYRange"]);
-  this.infoBox.add("z range", this, ["model","getZRange"]);
-  this.infoBox.add("Center", this, ["model","getCenter"]);
-  this.infoBox.add("Size", this, ["model","getSize"]);
-  this.infoBox.add("Surface area", this, ["model","surfaceArea"]);
-  this.infoBox.add("Volume", this, ["model","volume"]);
-  this.infoBox.add("Center of mass", this, ["model","centerOfMass"]);
+  this.infoBox.add("x range", this, ["model","getXRange"], undefined, d);
+  this.infoBox.add("y range", this, ["model","getYRange"], undefined, d);
+  this.infoBox.add("z range", this, ["model","getZRange"], undefined, d);
+  this.infoBox.add("Center", this, ["model","getCenter"], undefined, d);
+  this.infoBox.add("Size", this, ["model","getSize"], undefined, d);
+  this.infoBox.add("Surface area (" + this.displayUnits + "²)", this, ["model","surfaceArea"],
+    undefined, this.displayFactor(2));
+  this.infoBox.add("Volume (" + this.displayUnits + "³)", this, ["model","volume"],
+    undefined, this.displayFactor(3));
+  this.infoBox.add("Center of mass", this, ["model","centerOfMass"], undefined, d);
   this.infoBox.update();
 
   this.initViewport();
@@ -626,7 +679,9 @@ Meshy.prototype.onScaleToMeasurement = function() {
   if (!result || !result.ready) return;
 
   var key = this.measurementToScale;
-  var currentValue = result[key];
+  // in the display units, like the value entered
+  var currentValue = result[key] !== undefined ?
+    result[key] * this.measurementDisplayFactor(key) : undefined;
 
   if (currentValue !== undefined) {
     var factor = this.measurementToScaleValue / currentValue;
@@ -1049,8 +1104,9 @@ Meshy.prototype.scaleToRingSize = function() {
   var tmpVal = this.measurementToScaleValue;
   var tmpType = this.measurementToScale;
 
+  // ring sizes are diameters in mm
   this.measurementToScale = "diameter";
-  this.measurementToScaleValue = this.ringSize;
+  this.measurementToScaleValue = this.ringSize * this.displayFactor();
 
   this.onScaleToMeasurement();
   this.onFinishScale();
@@ -1099,9 +1155,11 @@ Meshy.prototype.buildMeasurementFolder = function() {
   this.crossSectionArrayFolder = this.measurementFolder.addFolder("Cross-section array", "Make multiple cross-section measurements.");
   this.crossSectionArrayFolder.add(this, "crossSectionArrayAxis", ["x", "y", "z"]).name("Axis")
     .title("Axis normal to the cross-section planes.");
-  this.crossSectionArrayFolder.add(this, "crossSectionArrayOffset", 0).precision(4).name("Min offset")
+  this.crossSectionArrayFolder.add(this, "crossSectionArrayOffset", 0).precision(4)
+    .name("Min offset (" + this.displayUnits + ")")
     .title("Offset from the mesh's minimum bound on the measurement axis.");
-  this.crossSectionArrayFolder.add(this, "crossSectionArrayIncrement", 0.0001).precision(4).name("Increment")
+  this.crossSectionArrayFolder.add(this, "crossSectionArrayIncrement", 0.0001).precision(4)
+    .name("Increment (" + this.displayUnits + ")")
     .title("Distance between adjacent cross-section planes.");
   this.crossSectionArrayFolder.add(this, "crossSectionArrayFilename").name("Filename")
     .title("Filename for the measurement result.")
@@ -1113,12 +1171,18 @@ Meshy.prototype.buildMeasurementFolder = function() {
   if (this.measurementsExist()) {
     var indices = {};
     this.forEachMeasurement(function(item, idx) {
-      indices[idx + " (" + item.measurement.getType() + ")"] = idx;
+      // numbered so that the same name twice still gives two entries
+      indices[(idx + 1) + ". " + item.name] = idx;
     });
 
     this.measurementFolder.add(this, "measurementIdx", indices).name("Current")
       .title("Current measurement.")
       .onChange(this.onSetCurrentMeasurement.bind(this));
+    var current = this.getMeasurementItem(this.measurementIdx);
+    this.measurementName = current ? current.name : "";
+    this.measurementNameController = this.measurementFolder.add(this, "measurementName").name("Name")
+      .title("Name of the current measurement, shown in the info box, on the report, and in saved files.")
+      .onFinishChange(this.renameCurrentMeasurement.bind(this));
     // todo: remove
     //this.measurementFolder.add(this, "measurementCalculate").name("Calculate");
     this.measurementFolder.add(this, "removeCurrentMeasurement").name("Remove")
@@ -1140,10 +1204,79 @@ Meshy.prototype.onSetCurrentMeasurement = function() {
   });
 
   // activate the current measurement
-  this.getMeasurementItem(currentIdx).measurement.activate();
+  var item = this.getMeasurementItem(currentIdx);
+  item.measurement.activate();
+
+  // show its name
+  this.measurementName = item.name;
+  if (this.measurementNameController) this.measurementNameController.updateDisplay();
 
   // current measurement changed, so rebuild the scale to measurement folder
   this.buildScaleToMeasurementFolder();
+}
+// rename the current measurement to this.measurementName
+Meshy.prototype.renameCurrentMeasurement = function() {
+  var item = this.getMeasurementItem(this.measurementIdx);
+  if (!item) return;
+
+  var name = String(this.measurementName).trim();
+
+  if (!name || name === item.name) {
+    this.measurementName = item.name;
+    if (this.measurementNameController) this.measurementNameController.updateDisplay();
+    return;
+  }
+
+  this.setMeasurementName(item, name);
+
+  // rebuild the folder for the new name in the Current list, but not while
+  // the name field's own event is still being handled
+  setTimeout(this.buildMeasurementFolder.bind(this), 0);
+}
+Meshy.prototype.setMeasurementName = function(item, name) {
+  item.name = name;
+
+  if (item.list) {
+    var type = item.measurement.getType();
+    item.list.setTitle(name + (type === Measurement.Types.angle ? " (°)" : " (" + this.displayUnits + ")"));
+  }
+}
+// default name for a new measurement of the given type, e.g. "Length 2"
+Meshy.prototype.defaultMeasurementName = function(params) {
+  var Types = Measurement.Types;
+  var type = params.type;
+  var label =
+    type === Types.length ? "Length" :
+    type === Types.contour ? "Contour" :
+    type === Types.angle ? "Angle" :
+    type === Types.circle ? "Circle" :
+    type === Types.crossSection ? "Cross-section " + params.axis :
+    type === Types.orientedCrossSection ? "Local cross-section" : "Measurement";
+
+  var count = 0;
+  this.forEachMeasurement(function(item) {
+    if (item.name && item.name.indexOf(label + " ") === 0) count++;
+  });
+
+  return label + " " + (count + 1);
+}
+// the main value of a measurement for the report and saved files, in the
+// display units: { name, value, unit }; value is null until it's measured
+Meshy.prototype.measurementSummary = function(item) {
+  var Types = Measurement.Types;
+  var type = item.measurement.getType();
+  var result = item.result;
+  var ready = result && result.ready;
+  var d = this.displayFactor();
+
+  if (type === Types.angle) {
+    return { name: item.name, value: ready ? result.angleDegrees : null, unit: "°" };
+  }
+
+  // circles give the circumference, cross-sections the contour length
+  var key = type === Types.circle ? "circumference" : "length";
+
+  return { name: item.name, value: ready && result[key] !== undefined ? result[key] * d : null, unit: this.displayUnits };
 }
 Meshy.prototype.onToggleConvexHull = function() {
   var convexHull = this.measureConvexHull;
@@ -1270,8 +1403,10 @@ Meshy.prototype.measureCrossSectionArray = function() {
   if (!this.model) return;
 
   var axis = this.crossSectionArrayAxis;
-  var increment = this.crossSectionArrayIncrement;
-  var offset = this.crossSectionArrayOffset;
+  // offset and increment are entered in the display units
+  var d = this.displayFactor();
+  var increment = this.crossSectionArrayIncrement / d;
+  var offset = this.crossSectionArrayOffset / d;
   var size = this.model.getSize()[axis];
   var min = this.model.getMin()[axis];
 
@@ -1296,10 +1431,11 @@ Meshy.prototype.measureCrossSectionArray = function() {
       axis: this.crossSectionArrayAxis,
       p: [point]
     });
+    // results in the display units
     results.push({
-      position: point[axis],
-      area: result.area,
-      length: result.length
+      position: point[axis] * d,
+      area: result.area * d * d,
+      length: result.length * d
     });
   }
 
@@ -1310,6 +1446,7 @@ Meshy.prototype.measureCrossSectionArray = function() {
     // https://stackoverflow.com/a/30800715
     dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify({
       axis: axis,
+      units: this.displayUnits,
       results: results
     }));
   }
@@ -1362,9 +1499,16 @@ Meshy.prototype.addMeasurement = function(params) {
   // have a set color for the first measurement, random colors for anything after that
   params.color = !this.measurementsExist() ? 0x8adeff : Math.round((Math.random() / 2.0 + 0.5) * 0xffffff);
 
-  // construct the structure containing the measurement, its infobox list, and the result
+  // name given (e.g. when loading) or a default like "Length 2"; not a
+  // measurement param
+  var name = params.name || this.defaultMeasurementName(params);
+  delete params.name;
+
+  // construct the structure containing the measurement, its name, its
+  // infobox list, and the result
   var item = {
     measurement: new Measurement(this.pointer, this.scene),
+    name: name,
     list: null,
     result: null
   };
@@ -1373,44 +1517,50 @@ Meshy.prototype.addMeasurement = function(params) {
   this.measurementData.push(item);
 
   var type = params.type;
+  var uuid = item.measurement.uuid;
+  // lengths and areas in the display units
+  var units = " (" + this.displayUnits + ")";
+  var areaTitle = "Area (" + this.displayUnits + "²)";
+  var d = this.displayFactor();
+  var d2 = this.displayFactor(2);
 
   if (type === Measurement.Types.length) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Length", params.color);
-    item.list.add("Length", item, ["result", "length"]);
-    item.list.add("X", item, ["result", "vector", "x"]);
-    item.list.add("Y", item, ["result", "vector", "y"]);
-    item.list.add("Z", item, ["result", "vector", "z"]);
+    item.list = this.infoBox.addList(uuid, name + units, params.color);
+    item.list.add("Length", item, ["result", "length"], undefined, d);
+    item.list.add("X", item, ["result", "vector", "x"], undefined, d);
+    item.list.add("Y", item, ["result", "vector", "y"], undefined, d);
+    item.list.add("Z", item, ["result", "vector", "z"], undefined, d);
   }
   else if (type === Measurement.Types.contour) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Contour", params.color);
-    item.list.add("Contour length", item, ["result", "length"]);
-    item.list.add("Straight length", item, ["result", "straightLength"]);
+    item.list = this.infoBox.addList(uuid, name + units, params.color);
+    item.list.add("Contour length", item, ["result", "length"], undefined, d);
+    item.list.add("Straight length", item, ["result", "straightLength"], undefined, d);
   }
   else if (type === Measurement.Types.angle) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Angle", params.color);
+    item.list = this.infoBox.addList(uuid, name + " (°)", params.color);
     item.list.add("Angle", item, ["result", "angleDegrees"]);
   }
   else if (type === Measurement.Types.circle) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Circle", params.color);
-    item.list.add("Radius", item, ["result", "radius"]);
-    item.list.add("Diameter", item, ["result", "diameter"]);
-    item.list.add("Circumference", item, ["result", "circumference"]);
-    item.list.add("Area", item, ["result", "area"]);
+    item.list = this.infoBox.addList(uuid, name + units, params.color);
+    item.list.add("Radius", item, ["result", "radius"], undefined, d);
+    item.list.add("Diameter", item, ["result", "diameter"], undefined, d);
+    item.list.add("Circumference", item, ["result", "circumference"], undefined, d);
+    item.list.add(areaTitle, item, ["result", "area"], undefined, d2);
     item.list.add("Normal", item, ["result", "normal"]);
   }
   else if (type === Measurement.Types.crossSection) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Cross-section " + params.axis, params.color);
-    item.list.add("Area", item, ["result", "area"]);
-    item.list.add("Min", item, ["result", "boundingBox", "min"]);
-    item.list.add("Max", item, ["result", "boundingBox", "max"]);
-    item.list.add("Contour length", item, ["result", "length"]);
+    item.list = this.infoBox.addList(uuid, name + units, params.color);
+    item.list.add(areaTitle, item, ["result", "area"], undefined, d2);
+    item.list.add("Min", item, ["result", "boundingBox", "min"], undefined, d);
+    item.list.add("Max", item, ["result", "boundingBox", "max"], undefined, d);
+    item.list.add("Contour length", item, ["result", "length"], undefined, d);
   }
   else if (type === Measurement.Types.orientedCrossSection) {
-    item.list = this.infoBox.addList(item.measurement.uuid, "Local cross-section", params.color);
-    item.list.add("Area", item, ["result", "area"]);
-    item.list.add("Min", item, ["result", "boundingBox", "min"]);
-    item.list.add("Max", item, ["result", "boundingBox", "max"]);
-    item.list.add("Contour length", item, ["result", "length"]);
+    item.list = this.infoBox.addList(uuid, name + units, params.color);
+    item.list.add(areaTitle, item, ["result", "area"], undefined, d2);
+    item.list.add("Min", item, ["result", "boundingBox", "min"], undefined, d);
+    item.list.add("Max", item, ["result", "boundingBox", "max"], undefined, d);
+    item.list.add("Contour length", item, ["result", "length"], undefined, d);
   }
   else return;
 
@@ -1442,6 +1592,882 @@ Meshy.prototype.addMeasurement = function(params) {
   this.buildMeasurementFolder();
   this.buildScaleToMeasurementFolder();
   this.onSetCurrentMeasurement();
+}
+Meshy.prototype.buildAutoMeasureFolder = function() {
+  var am = this.autoMeasure;
+
+  for (var modeKey in this.autoMeasureFolders) {
+    var folder = this.autoMeasureFolders[modeKey];
+    var mode = AutoMeasure.Modes[modeKey];
+
+    this.clearFolder(folder);
+
+    folder.add(this.autoMeasureActions[modeKey], "run").name("Measure")
+      .title(mode.measureTitle);
+
+    // the rest only for the active set
+    if (!am || am.mode !== mode) continue;
+
+    var landmarks = { "(choose)": "" };
+    for (var key in mode.landmarkNames) {
+      landmarks[mode.landmarkNames[key]] = key;
+    }
+
+    folder.add(this, "autoMeasureLandmark", landmarks).name(mode.moveName)
+      .title(mode.moveTitle)
+      .onChange(this.onAutoMeasureLandmark.bind(this));
+    folder.add(this, "autoMeasureShowTapes").name("Show tapes")
+      .title("Show the tapes for each measurement on the model.")
+      .onChange(this.autoMeasureDraw.bind(this));
+    folder.add(this, "autoMeasureClear").name("Clear")
+      .title("Remove the automatic measurements.");
+  }
+}
+// returns true if the model can be measured, else warns
+Meshy.prototype.autoMeasureCanMeasure = function() {
+  if (this.sliceModeOn) {
+    this.printout.warn("Cannot measure mesh while slice mode is on.");
+    return false;
+  }
+
+  if (!this.model) {
+    this.printout.warn("Import a scan to measure.");
+    return false;
+  }
+
+  return true;
+}
+// measure the model with the given set of measurements (a key of
+// AutoMeasure.Modes)
+Meshy.prototype.autoMeasureRun = function(modeKey) {
+  if (!this.autoMeasureCanMeasure()) return;
+
+  var mode = AutoMeasure.Modes[modeKey];
+  var sliceMesh, landmarks;
+
+  try {
+    sliceMesh = new AutoMeasure.SliceMesh(this.model.getMesh());
+    landmarks = mode.findLandmarks(sliceMesh);
+  }
+  catch (e) {
+    this.printout.error(e.message);
+    return;
+  }
+
+  this.autoMeasureStart(sliceMesh, landmarks, mode);
+
+  this.printout.log(mode.measuredMessage);
+}
+// set up the measurements from the given landmarks
+Meshy.prototype.autoMeasureStart = function(sliceMesh, landmarks, mode) {
+  this.autoMeasureClear();
+
+  this.autoMeasure = {
+    mode: mode,
+    sliceMesh: sliceMesh,
+    landmarks: landmarks,
+    results: null,
+    list: this.infoBox.addList("autoMeasure", "Auto Measure " + mode.name + " (cm)", 0xffa040)
+  };
+
+  var list = this.autoMeasure.list;
+  mode.definitions.forEach(function(def) {
+    list.add(def.name, this, ["autoMeasureValues", def.key]);
+  }, this);
+
+  if (!this.reportName) this.setReportName(this.scanName());
+
+  this.autoMeasureUpdate();
+  this.buildAutoMeasureFolder();
+}
+// report and saved measurements: these cover all the measurements shown, both
+// automatic and manual
+
+// the scan's filename without the extension
+Meshy.prototype.scanName = function() {
+  return (this.filename || "scan").replace(/\.(obj|stl)$/i, "");
+}
+Meshy.prototype.setReportName = function(name) {
+  this.reportName = name;
+  if (this.reportNameController) this.reportNameController.updateDisplay();
+}
+// the manual measurements that have a result
+Meshy.prototype.measuredItems = function() {
+  var items = [];
+
+  this.forEachMeasurement(function(item) {
+    if (item.result && item.result.ready) items.push(item);
+  });
+
+  return items;
+}
+// download text as a file
+Meshy.prototype.downloadText = function(text, fname, type) {
+  var blob = new Blob([text], { type: type });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+
+  a.href = url;
+  a.download = fname;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function() {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  });
+}
+// save all the measurements shown to a JSON file
+Meshy.prototype.saveMeasurements = function() {
+  if (!this.model) {
+    this.printout.warn("Import a scan to save its measurements.");
+    return;
+  }
+
+  var am = this.autoMeasure;
+  var cover = this.cover;
+  var items = this.measuredItems();
+
+  if (!am && !cover && items.length === 0) {
+    this.printout.warn("There are no measurements to save.");
+    return;
+  }
+
+  var _this = this;
+  var round = function(v) { return v === null ? null : Math.round(v * 10) / 10; };
+  var values = [];
+
+  if (am) {
+    am.results.forEach(function(result) {
+      values.push({
+        group: result.group,
+        name: result.name,
+        value: result.value === null ? null : round(result.value / 10),
+        unit: "cm"
+      });
+    });
+  }
+
+  if (cover) {
+    cover.rows.forEach(function(row) {
+      values.push({
+        group: "Cover (Stretchy)",
+        name: _this.coverRowLabel(row),
+        value: row.value === null ? null : round(row.value / 10),
+        unit: "cm"
+      });
+    });
+  }
+
+  items.forEach(function(item) {
+    var summary = _this.measurementSummary(item);
+
+    values.push({ group: "Measurements", name: summary.name, value: round(summary.value), unit: summary.unit });
+  });
+
+  var data = MeasurementFile.create({
+    name: this.reportName,
+    scan: this.filename,
+    min: this.model.getMin(),
+    size: this.model.getSize(),
+    autoMeasure: am ? { mode: am.mode.key, landmarks: am.landmarks } : null,
+    cover: cover ? cover.state : null,
+    measurements: items.map(function(item) {
+      var params = item.measurement.getParams();
+
+      return {
+        name: item.name,
+        type: params.type,
+        axis: params.axis,
+        convexHull: params.convexHull,
+        nearestContour: params.nearestContour,
+        points: params.p
+      };
+    }),
+    values: values
+  });
+
+  // e.g. <report name>_basic_measurements.json if there are basic automatic
+  // measurements, else <report name>_measurements.json
+  var base = (this.reportName || this.scanName()).replace(/[\\\/:*?"<>|]/g, "_");
+  var fname = base + (am ? "_" + am.mode.key : "") + "_measurements.json";
+
+  this.downloadText(JSON.stringify(data, null, 2), fname, "application/json");
+
+  this.printout.log("Saved " + fname + ".");
+}
+// choose a file saved by saveMeasurements and load it onto the model
+Meshy.prototype.loadMeasurements = function() {
+  if (!this.autoMeasureCanMeasure()) return;
+
+  var _this = this;
+
+  if (!this.measurementsFileInput) {
+    var input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.style.display = "none";
+    input.onchange = function() {
+      var file = this.files[0];
+      this.value = "";
+      if (file) _this.loadMeasurementsFile(file);
+    };
+    document.body.appendChild(input);
+    this.measurementsFileInput = input;
+  }
+
+  this.measurementsFileInput.click();
+}
+// load saved measurements onto the model, replacing the ones shown
+Meshy.prototype.loadMeasurementsFile = function(file) {
+  var _this = this;
+  var reader = new FileReader();
+
+  reader.onload = function() {
+    if (!_this.autoMeasureCanMeasure()) return;
+
+    var read, mode = null, sliceMesh = null, landmarks = null, coverState = null;
+
+    try {
+      read = MeasurementFile.read(JSON.parse(reader.result), _this.model.getMin(), _this.model.getSize());
+
+      if (read.autoMeasure) {
+        mode = AutoMeasure.Modes[read.autoMeasure.mode];
+        if (!mode) throw new Error("This file has Auto Measure " + read.autoMeasure.mode +
+          " measurements, which this version can't load.");
+
+        sliceMesh = new AutoMeasure.SliceMesh(_this.model.getMesh());
+        landmarks = read.autoMeasure.landmarks;
+
+        // any landmarks missing from the file are found automatically
+        var missing = typeof landmarks.midX !== "number" ||
+          Object.keys(mode.landmarkNames).some(function(key) { return !landmarks[key]; });
+
+        if (missing) {
+          var found = mode.findLandmarks(sliceMesh);
+
+          for (var key in found) {
+            if (landmarks[key] === undefined) landmarks[key] = found[key];
+          }
+        }
+      }
+
+      if (read.cover) {
+        sliceMesh = sliceMesh || new AutoMeasure.SliceMesh(_this.model.getMesh());
+        coverState = {
+          base: sliceMesh.min.z,
+          top: sliceMesh.max.z,
+          levels: read.cover.levels.map(function(z, i) { return { id: "L" + i, z: z }; }),
+          neck: read.cover.neck
+        };
+      }
+    }
+    catch (e) {
+      _this.printout.error("Couldn't load " + file.name + ": " + e.message);
+      return;
+    }
+
+    // replace the measurements shown
+    _this.autoMeasureClear();
+    _this.coverClear();
+    _this.removeAllMeasurements();
+
+    if (mode) _this.autoMeasureStart(sliceMesh, landmarks, mode);
+    if (coverState) _this.coverStart(sliceMesh, coverState);
+
+    var types = Object.keys(Measurement.Types).map(function(k) { return Measurement.Types[k]; });
+
+    read.measurements.forEach(function(m) {
+      if (types.indexOf(m.type) < 0) return;
+
+      var params = { name: m.name || undefined, type: m.type, p: m.points };
+
+      ["axis", "convexHull", "nearestContour"].forEach(function(key) {
+        if (m[key] !== undefined) params[key] = m[key];
+      });
+
+      _this.addMeasurement(params);
+    });
+
+    if (read.name) _this.setReportName(read.name);
+
+    if (read.sizeDifference > 2) {
+      _this.printout.warn("These measurements were saved from a scan of a different size (by up to " +
+        read.sizeDifference.toFixed(0) + "mm), so they may be in the wrong place.");
+    }
+    if (read.scan && read.scan !== _this.filename) {
+      _this.printout.warn("These measurements were saved from " + read.scan + ".");
+    }
+
+    _this.printout.log("Loaded " + file.name + ".");
+  };
+
+  reader.readAsText(file);
+}
+// recalculate the measurements from the current landmarks
+Meshy.prototype.autoMeasureUpdate = function() {
+  var am = this.autoMeasure;
+  if (!am) return;
+
+  am.results = am.mode.measure(am.sliceMesh, am.landmarks);
+
+  var values = {};
+  am.results.forEach(function(result) {
+    values[result.key] = result.value === null ? "-" : (result.value / 10).toFixed(1);
+  });
+  this.autoMeasureValues = values;
+
+  am.list.update();
+
+  this.autoMeasureDraw();
+}
+Meshy.prototype.autoMeasureDraw = function() {
+  this.autoMeasureRemoveMarkers();
+
+  var am = this.autoMeasure;
+  if (!am) return;
+
+  var scene = this.scene;
+  var name = "autoMeasureMarker";
+
+  if (this.autoMeasureShowTapes) {
+    am.results.forEach(function(result) {
+      if (result.segments.length === 0) return;
+
+      var color = result.group === "Circumferences" ? 0x2a7fff : 0xff6a00;
+      var marker = Markers.create(Markers.Types.contour, { name: name, color: color });
+
+      marker.setFromSegments(result.segments);
+      marker.activate();
+      marker.addToScene(scene);
+    });
+  }
+
+  var moving = this.autoMeasureLandmark;
+  var radius = this.model ? this.model.getMaxSize() * 0.005 : 4;
+
+  for (var key in am.landmarks) {
+    if (!am.landmarks[key] || !am.landmarks[key].isVector3) continue;
+
+    var marker = Markers.create(Markers.Types.sphere, {
+      name: name,
+      color: key === moving ? 0xffee00 : 0xff2050
+    });
+
+    marker.setPosition(am.landmarks[key]);
+    marker.setRadius(key === moving ? radius * 2 : radius);
+    marker.activate();
+    marker.addToScene(scene);
+  }
+}
+Meshy.prototype.autoMeasureRemoveMarkers = function() {
+  for (var i = this.scene.children.length - 1; i >= 0; i--) {
+    if (this.scene.children[i].name === "autoMeasureMarker") {
+      this.scene.remove(this.scene.children[i]);
+    }
+  }
+}
+Meshy.prototype.onAutoMeasureLandmark = function() {
+  var key = this.autoMeasureLandmark;
+  var pointer = this.pointer;
+  var _this = this;
+
+  if (!key) {
+    this.autoMeasureEndMove();
+    return;
+  }
+
+  this.printout.log("Click on the model to place: " + this.autoMeasure.mode.landmarkNames[key] + ".");
+
+  pointer.addCallback("autoMeasure", function(intersection) {
+    _this.autoMeasure.landmarks[key] = intersection.point.clone();
+    _this.autoMeasureEndMove();
+    _this.autoMeasureUpdate();
+  });
+  pointer.activate();
+
+  this.autoMeasureDraw();
+}
+Meshy.prototype.autoMeasureEndMove = function() {
+  var pointer = this.pointer;
+
+  // only turn the pointer off if nothing else is using it
+  if (pointer.removeCallback("autoMeasure") && Object.keys(pointer.callbacks).length === 0) {
+    pointer.deactivate();
+  }
+
+  this.autoMeasureLandmark = "";
+  this.buildAutoMeasureFolder();
+  this.autoMeasureDraw();
+}
+Meshy.prototype.autoMeasureClear = function() {
+  if (this.autoMeasure) {
+    this.infoBox.removeList(this.autoMeasure.list);
+    this.autoMeasure = null;
+    this.autoMeasureEndMove();
+  }
+
+  this.autoMeasureRemoveMarkers();
+  this.autoMeasureValues = {};
+  this.buildAutoMeasureFolder();
+}
+// cover measurements (stretchy)
+
+Meshy.prototype.buildCoverFolder = function() {
+  var folder = this.coverFolder;
+  var cover = this.cover;
+
+  this.clearFolder(folder);
+
+  folder.add(this, "coverRun").name("Measure")
+    .title("Measure the circumferences every 5cm from the base up, and at the top and base of the neck, parallel to the neck cut.");
+
+  if (!cover) return;
+
+  var levels = { "(choose)": "" };
+  cover.rows.forEach(function(row) {
+    var label = this.coverRowLabel(row);
+
+    while (levels.hasOwnProperty(label)) label += " ";
+    levels[label] = row.key;
+  }, this);
+
+  folder.add(this, "coverLevel", levels).name("Move level")
+    .title("Choose a level, then click on the model where it should be, or type its height.")
+    .onChange(this.onCoverLevel.bind(this));
+
+  if (this.coverLevel) {
+    var neck = this.coverIsNeck(this.coverLevel);
+
+    folder.add(this, "coverLevelValue").name(neck ? "Below cut (cm)" : "Height (cm)").step(0.1)
+      .title(neck ?
+        "Distance of this section below the neck cut, at right angles to the cut, in cm." :
+        "Height of this level above the base of the model, in cm.")
+      .onFinishChange(this.setCoverLevelValue.bind(this));
+  }
+
+  folder.add(this, "coverShowTapes").name("Show tapes")
+    .title("Show the tapes for each measurement on the model.")
+    .onChange(this.coverDraw.bind(this));
+  folder.add(this, "coverCopy").name("Copy for Excel")
+    .title("Copy the heights and circumferences in cm, from the top down, as two columns to paste into a spreadsheet.");
+  folder.add(this, "coverClear").name("Clear")
+    .title("Remove the cover measurements.");
+}
+Meshy.prototype.coverIsNeck = function(key) {
+  return key === "neckTop" || key === "neckBase";
+}
+// e.g. "85.0 cm" or "96.2 cm (neck top)": the height above the base, which
+// for the neck sections is that of their highest point
+Meshy.prototype.coverRowLabel = function(row) {
+  var neck = row.kind === "neckTop" ? "neck top" : row.kind === "neckBase" ? "neck base" : null;
+
+  if (row.height === null) return "Not found (" + neck + ")";
+
+  return (row.height / 10).toFixed(1) + " cm" + (neck ? " (" + neck + ")" : "");
+}
+Meshy.prototype.coverRun = function() {
+  if (!this.autoMeasureCanMeasure()) return;
+
+  var sliceMesh, state;
+
+  try {
+    sliceMesh = new AutoMeasure.SliceMesh(this.model.getMesh());
+    state = CoverMeasure.find(sliceMesh);
+  }
+  catch (e) {
+    this.printout.error(e.message);
+    return;
+  }
+
+  this.coverStart(sliceMesh, state);
+
+  if (state.neck) {
+    this.printout.log("Measured. Choose a level under Move level to adjust it.");
+  }
+  else {
+    this.printout.warn("Measured, but there's no flat cut across the top of the neck, so there are no neck measurements. " +
+      "Add them under Measure if needed.");
+  }
+}
+Meshy.prototype.coverStart = function(sliceMesh, state) {
+  this.coverClear();
+
+  this.cover = {
+    sliceMesh: sliceMesh,
+    state: state,
+    rows: [],
+    excluded: [],
+    list: null
+  };
+
+  if (!this.reportName) this.setReportName(this.scanName());
+
+  this.coverUpdate();
+}
+// remeasure from the current levels
+Meshy.prototype.coverUpdate = function() {
+  var cover = this.cover;
+  if (!cover) return;
+
+  var result = CoverMeasure.measure(cover.sliceMesh, cover.state);
+
+  cover.rows = result.rows;
+  cover.excluded = result.excluded;
+
+  // the labels change with the heights, so remake the list
+  if (cover.list) this.infoBox.removeList(cover.list);
+  cover.list = this.infoBox.addList("cover", "Cover (Stretchy): height, circumference (cm)", 0x30b070);
+
+  var values = {};
+  cover.rows.forEach(function(row) {
+    values[row.key] = row.value === null ? "-" : (row.value / 10).toFixed(1);
+    cover.list.add(this.coverRowLabel(row), this, ["coverValues", row.key]);
+  }, this);
+  this.coverValues = values;
+  cover.list.update();
+
+  // a level that's been moved into the neck is left out
+  if (this.coverLevel && !this.coverRow(this.coverLevel)) {
+    this.printout.warn("That level cuts into the neck, so it's left out.");
+    this.coverEndMove();
+    return;
+  }
+
+  this.buildCoverFolder();
+  this.coverDraw();
+}
+Meshy.prototype.coverRow = function(key) {
+  var rows = this.cover ? this.cover.rows : [];
+
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].key === key) return rows[i];
+  }
+
+  return null;
+}
+Meshy.prototype.coverDraw = function() {
+  this.coverRemoveMarkers();
+
+  var cover = this.cover;
+  if (!cover) return;
+
+  var scene = this.scene;
+  var selected = this.coverLevel;
+  var showTapes = this.coverShowTapes;
+
+  cover.rows.forEach(function(row) {
+    if (row.segments.length === 0) return;
+    if (!showTapes && row.key !== selected) return;
+
+    var color = row.key === selected ? 0xffcc00 : row.kind === "level" ? 0x20a060 : 0x9040ff;
+    var marker = Markers.create(Markers.Types.contour, { name: "coverMarker", color: color });
+
+    marker.setFromSegments(row.segments);
+    marker.activate();
+    marker.addToScene(scene);
+  });
+}
+Meshy.prototype.coverRemoveMarkers = function() {
+  for (var i = this.scene.children.length - 1; i >= 0; i--) {
+    if (this.scene.children[i].name === "coverMarker") {
+      this.scene.remove(this.scene.children[i]);
+    }
+  }
+}
+// the value in the Height or Below cut field for a level: cm above the base,
+// or for the neck sections cm below the cut
+Meshy.prototype.coverGetLevelValue = function(key) {
+  var state = this.cover.state;
+
+  if (key === "neckTop") return Math.round(state.neck.top) / 10;
+  if (key === "neckBase") return Math.round(state.neck.base) / 10;
+
+  for (var i = 0; i < state.levels.length; i++) {
+    if (state.levels[i].id === key) return Math.round(state.levels[i].z - state.base) / 10;
+  }
+
+  return 0;
+}
+Meshy.prototype.onCoverLevel = function() {
+  var key = this.coverLevel;
+  var _this = this;
+
+  if (!key) {
+    this.coverEndMove();
+    return;
+  }
+
+  this.coverLevelValue = this.coverGetLevelValue(key);
+
+  this.printout.log("Click on the model where " + this.coverRowLabel(this.coverRow(key)) + " should be, or type its " +
+    (this.coverIsNeck(key) ? "distance below the cut." : "height."));
+
+  this.pointer.addCallback("coverMeasure", function(intersection) {
+    _this.coverMoveLevel(key, intersection.point);
+  });
+  this.pointer.activate();
+
+  // rebuilding the folder from its own controller's change handler upsets
+  // dat.gui
+  setTimeout(function() {
+    _this.buildCoverFolder();
+    _this.coverDraw();
+  });
+}
+// move a level to the height of a point, or a neck section to the plane
+// parallel to the cut through the point
+Meshy.prototype.coverMoveLevel = function(key, point) {
+  var state = this.cover.state;
+
+  if (this.coverIsNeck(key)) {
+    this.coverSetLevel(key, CoverMeasure.depthOf(state.neck.cut, point));
+  }
+  else {
+    this.coverSetLevel(key, point.z - state.base);
+  }
+}
+// set a level's height above the base, or a neck section's depth below the
+// cut, in mm
+Meshy.prototype.coverSetLevel = function(key, value) {
+  var state = this.cover.state;
+
+  if (this.coverIsNeck(key)) {
+    state.neck[key === "neckTop" ? "top" : "base"] = Math.max(value, 0.5);
+  }
+  else {
+    var z = Math.min(Math.max(state.base + value, state.base + 0.5), state.top - 0.5);
+
+    state.levels.forEach(function(level) {
+      if (level.id === key) level.z = z;
+    });
+  }
+
+  this.coverLevelValue = this.coverGetLevelValue(key);
+  this.coverUpdate();
+}
+Meshy.prototype.setCoverLevelValue = function() {
+  if (!this.cover || !this.coverLevel) return;
+
+  var key = this.coverLevel;
+  var value = this.coverLevelValue * 10;
+  var _this = this;
+
+  setTimeout(function() { _this.coverSetLevel(key, value); });
+}
+Meshy.prototype.coverEndMove = function() {
+  var pointer = this.pointer;
+
+  // only turn the pointer off if nothing else is using it
+  if (pointer.removeCallback("coverMeasure") && Object.keys(pointer.callbacks).length === 0) {
+    pointer.deactivate();
+  }
+
+  this.coverLevel = "";
+  this.buildCoverFolder();
+  this.coverDraw();
+}
+Meshy.prototype.coverClear = function() {
+  if (this.cover) {
+    if (this.cover.list) this.infoBox.removeList(this.cover.list);
+    this.cover = null;
+    this.coverEndMove();
+  }
+
+  this.coverRemoveMarkers();
+  this.coverValues = {};
+  this.buildCoverFolder();
+}
+// copy the cover measurements as tab-separated text, which pastes into a
+// spreadsheet as two columns, and show it in case copying isn't allowed
+Meshy.prototype.coverCopy = function() {
+  if (!this.cover) {
+    this.printout.warn("Measure first.");
+    return;
+  }
+
+  var text = CoverMeasure.tableText(this.cover.rows);
+  var printout = this.printout;
+
+  var overlay = document.createElement("div");
+  overlay.style.cssText = "position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.7);" +
+    "display:flex;align-items:center;justify-content:center;";
+
+  var box = document.createElement("div");
+  box.style.cssText = "background:#fff;color:#111;padding:14px;border-radius:4px;font:13px Arial,sans-serif;" +
+    "display:flex;flex-direction:column;gap:8px;max-height:90vh;";
+
+  var heading = document.createElement("div");
+  heading.textContent = "Height and circumference (cm), from the top down. Paste into a spreadsheet.";
+
+  var area = document.createElement("textarea");
+  area.value = text;
+  area.readOnly = true;
+  area.rows = Math.min(30, this.cover.rows.length + 1);
+  area.style.cssText = "width:260px;font:13px monospace;tab-size:10;resize:vertical;";
+
+  var status = document.createElement("div");
+  status.style.cssText = "color:#286;min-height:1em;";
+
+  var toolbar = document.createElement("div");
+  toolbar.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
+
+  function copy() {
+    function copied() {
+      status.textContent = "Copied.";
+      printout.log("Copied the cover measurements.");
+    }
+
+    area.focus();
+    area.select();
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(copied, function() {
+        if (document.execCommand("copy")) copied();
+        else status.textContent = "Couldn't copy: select the text and copy it with Ctrl+C.";
+      });
+    }
+    else if (document.execCommand("copy")) copied();
+    else status.textContent = "Couldn't copy: select the text and copy it with Ctrl+C.";
+  }
+
+  function button(label, onClick) {
+    var b = document.createElement("button");
+    b.textContent = label;
+    b.style.cssText = "padding:6px 18px;font-size:14px;cursor:pointer;";
+    b.onclick = onClick;
+    toolbar.appendChild(b);
+  }
+
+  button("Copy", copy);
+  button("Close", function() { document.body.removeChild(overlay); });
+
+  box.appendChild(heading);
+  box.appendChild(area);
+  box.appendChild(status);
+  box.appendChild(toolbar);
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  copy();
+}
+// show a printable report of all the measurements shown
+Meshy.prototype.printReport = function() {
+  if (!this.model) {
+    this.printout.warn("Import a scan to report its measurements.");
+    return;
+  }
+
+  var am = this.autoMeasure;
+  var cover = this.cover;
+  var items = this.measuredItems();
+
+  if (!am && !cover && items.length === 0) {
+    this.printout.warn("There are no measurements to report.");
+    return;
+  }
+
+  var html = AutoMeasure.reportHTML({
+    name: this.reportName || this.scanName(),
+    filename: this.filename,
+    mode: am ? am.mode.key : null,
+    results: am ? am.results : [],
+    measurements: items.map(this.measurementSummary.bind(this)),
+    cover: cover ? cover.rows.map(function(row) {
+      return { name: this.coverRowLabel(row), value: row.value };
+    }, this) : [],
+    images: this.captureReportViews()
+  });
+
+  // show the report over the viewport, with buttons to print it or close it
+  var overlay = document.createElement("div");
+  overlay.style.cssText = "position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.7);" +
+    "display:flex;flex-direction:column;align-items:center;padding:12px;box-sizing:border-box;";
+
+  var toolbar = document.createElement("div");
+  toolbar.style.cssText = "display:flex;gap:8px;margin-bottom:8px;";
+
+  var frame = document.createElement("iframe");
+  frame.style.cssText = "flex:1;width:100%;max-width:230mm;border:0;background:#fff;";
+  frame.srcdoc = html;
+
+  function button(label, onClick) {
+    var b = document.createElement("button");
+    b.textContent = label;
+    b.style.cssText = "padding:6px 18px;font-size:14px;cursor:pointer;";
+    b.onclick = onClick;
+    toolbar.appendChild(b);
+  }
+
+  button("Print", function() { frame.contentWindow.print(); });
+  button("Close", function() { document.body.removeChild(overlay); });
+
+  overlay.appendChild(toolbar);
+  overlay.appendChild(frame);
+  document.body.appendChild(overlay);
+}
+// render front, side, and back views of the model with the measurement
+// markers, on a white background; returns an array of { name, url }
+Meshy.prototype.captureReportViews = function() {
+  var renderer = this.renderer;
+  var camera = this.camera;
+  var controls = this.controls;
+  var scene = this.scene;
+
+  var saved = {
+    r: controls.r,
+    phi: controls.phi,
+    theta: controls.theta,
+    origin: controls.origin.clone(),
+    aspect: camera.aspect,
+    background: scene.background,
+    pixelRatio: renderer.getPixelRatio()
+  };
+
+  // hide everything except the model and the measurement markers
+  var hidden = [];
+  scene.traverse(function(o) {
+    if (o.visible && (o.name === "buildVolume" || (this.pointer.cursor && o === this.pointer.cursor.object))) {
+      o.visible = false;
+      hidden.push(o);
+    }
+  }.bind(this));
+
+  var width = 500, height = 900;
+  var size = this.model.getSize();
+  var center = this.model.getCenter();
+  var halfFov = camera.fov * Math.PI / 360;
+  var r = Math.max(size.z / 2, size.x / 2 * height / width) * 1.08 / Math.tan(halfFov) + Math.max(size.x, size.y) / 2;
+
+  renderer.setPixelRatio(1);
+  renderer.setSize(width, height, false);
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+  scene.background = new THREE.Color(0xffffff);
+
+  var views = [
+    { name: "Front", phi: -Math.PI / 2 },
+    { name: "Side", phi: 0 },
+    { name: "Back", phi: Math.PI / 2 }
+  ];
+
+  var images = views.map(function(view) {
+    controls.update({ origin: center, r: r, phi: view.phi, theta: Math.PI / 2 });
+    renderer.clear();
+    renderer.render(scene, camera);
+
+    return { name: view.name, url: renderer.domElement.toDataURL("image/png") };
+  });
+
+  // restore the viewport
+  hidden.forEach(function(o) { o.visible = true; });
+  scene.background = saved.background;
+  renderer.setPixelRatio(saved.pixelRatio);
+  renderer.setSize(this.container.offsetWidth, this.container.offsetHeight);
+  camera.aspect = saved.aspect;
+  camera.updateProjectionMatrix();
+  controls.update({ origin: saved.origin, r: saved.r, phi: saved.phi, theta: saved.theta });
+
+  return images;
 }
 Meshy.prototype.forEachMeasurement = function(fn) {
   for (var m = 0; m < this.measurementData.length; m++) {
@@ -1518,12 +2544,26 @@ Meshy.prototype.onChangeMeasurementToScale = function() {
   if (!result || !result.ready) return;
 
   // the new value defaults to the current value
-  this.measurementToScaleValue = result[this.measurementToScale];
+  var key = this.measurementToScale;
+  this.measurementToScaleValue = result[key] !== undefined ?
+    result[key] * this.measurementDisplayFactor(key) : undefined;
 
   // update controller
   var controller = this.measurementToScaleValueController;
 
-  if (controller) controller.updateDisplay();
+  if (controller) {
+    controller.name("Value (" + this.displayUnits + (key === "area" ? "²" : "") + ")");
+    controller.updateDisplay();
+  }
+}
+// factor to convert a length from the model's units to the display units;
+// power is 2 for areas, 3 for volumes
+Meshy.prototype.displayFactor = function(power) {
+  return Math.pow(Units.getFactor(this.units, this.displayUnits), power || 1);
+}
+// display factor for the given measurement result key
+Meshy.prototype.measurementDisplayFactor = function(key) {
+  return this.displayFactor(key === "area" ? 2 : 1);
 }
 Meshy.prototype.onRemoveLastMeasurement = function() {
   if (this.measurementsExist()) return;
@@ -2359,6 +3399,10 @@ Meshy.prototype.delete = function() {
   this.endSliceMode();
 
   this.removeAllMeasurements();
+  this.autoMeasureClear();
+  this.coverClear();
+  // the next scan is probably for someone else
+  this.setReportName("");
   this.endSetBase();
 
   this.editStack.clear();
